@@ -70,6 +70,35 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
   const [showBoundingBox, setShowBoundingBox] = useState<boolean>(false);
   const [showAnalysisMenu, setShowAnalysisMenu] = useState<boolean>(false);
 
+  // Reconstruction Debug Toggles
+  const [showTerrainLayer, setShowTerrainLayer] = useState<boolean>(true);
+  const [showMainBuildingsLayer, setShowMainBuildingsLayer] = useState<boolean>(true);
+  const [showSurroundingBuildingsLayer, setShowSurroundingBuildingsLayer] = useState<boolean>(true);
+  const [showRoadsLayer, setShowRoadsLayer] = useState<boolean>(true);
+  const [showVegetationLayer, setShowVegetationLayer] = useState<boolean>(true);
+  const [useRgbTextures, setUseRgbTextures] = useState<boolean>(true);
+  const [useDebugMaterials, setUseDebugMaterials] = useState<boolean>(false);
+  const [showReconstructionPanel, setShowReconstructionPanel] = useState<boolean>(false);
+
+  // Reconstruction Telemetry
+  const [reconTelemetry, setReconTelemetry] = useState<{
+    sceneW: number; sceneD: number; sceneH: number;
+    terrainW: number; terrainD: number; terrainH: number;
+    centralW: number; centralD: number; centralH: number;
+    westW: number; westD: number; westH: number;
+    eastW: number; eastD: number; eastH: number;
+    p10: number; p50: number; p90: number;
+    malformedObjects: number;
+  }>({
+    sceneW: 100, sceneD: 100, sceneH: 25,
+    terrainW: 100, terrainD: 100, terrainH: 1.5,
+    centralW: 0, centralD: 0, centralH: 0,
+    westW: 0, westD: 0, westH: 0,
+    eastW: 0, eastD: 0, eastH: 0,
+    p10: 0, p50: 0, p90: 0,
+    malformedObjects: 0,
+  });
+
   const [measurePoints, setMeasurePoints] = useState<THREE.Vector3[]>([]);
   const [measureDistanceM, setMeasureDistanceM] = useState<number | null>(null);
 
@@ -632,165 +661,369 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
 
     const gw = mesh.grid_width;
     const gh = mesh.grid_height;
-    const planeSize = 100.0;
     const refH = depthShape?.[0] ?? 1024;
     const refW = depthShape?.[1] ?? 1024;
+
+    // CANONICAL COORDINATE MAPPING
+    const WORLD_WIDTH = 100.0;
+    const WORLD_DEPTH = (WORLD_WIDTH * gh) / gw;
+
+    // Calculate Percentiles for Telemetry
+    const sortedHeights = Array.from(mesh.heights).sort((a, b) => a - b);
+    const len = sortedHeights.length;
+    const p10Val = sortedHeights[Math.floor(len * 0.1)] || 0;
+    const p50Val = sortedHeights[Math.floor(len * 0.5)] || 0;
+    const p90Val = sortedHeights[Math.floor(len * 0.9)] || 0;
+
+    let malformedCount = 0;
+
+    // LAYER 1: TERRAIN EXTRACTION & FOOTPRINT MASKING
     const heightsFiltered = getEdgePreservedHeights(mesh);
-
     const isBuildingGrid = new Uint8Array(gw * gh);
-    const terrainHeights = new Float32Array(heightsFiltered);
+    const terrainHeights = new Float32Array(gw * gh);
+    const roadGrid = new Uint8Array(gw * gh);
 
+    // Mark Main Building Footprints
     sampleBuildings.forEach((bldg) => {
       const [bx, by, bw, bh] = bldg.bbox;
       const cMin = Math.max(0, Math.floor((bx / refW) * gw));
       const cMax = Math.min(gw - 1, Math.ceil(((bx + bw) / refW) * gw));
       const rMin = Math.max(0, Math.floor((by / refH) * gh));
       const rMax = Math.min(gh - 1, Math.ceil(((by + bh) / refH) * gh));
-      const groundH = bldg.ground_base_z_rel ?? 0.05;
 
       for (let r = rMin; r <= rMax; r++) {
         for (let c = cMin; c <= cMax; c++) {
-          const idx = r * gw + c;
-          isBuildingGrid[idx] = 1;
-          terrainHeights[idx] = groundH;
+          isBuildingGrid[r * gw + c] = 1;
         }
       }
     });
 
-    const surroundingBuildings: Array<{ centerU: number; centerV: number; widthU: number; heightV: number; groundRel: number; roofRel: number; avgColor: THREE.Color }> = [];
-    const clusterSize = 3;
-    for (let r = clusterSize; r < gh - clusterSize; r += clusterSize) {
-      for (let c = clusterSize; c < gw - clusterSize; c += clusterSize) {
+    // Detect Secondary Building Clusters (Surrounding Buildings)
+    const surroundingBuildings: Array<{
+      centerU: number; centerV: number; widthU: number; heightV: number;
+      groundY: number; roofRel: number; avgColor: THREE.Color;
+    }> = [];
+
+    const clusterStep = 3;
+    for (let r = clusterStep; r < gh - clusterStep; r += clusterStep) {
+      for (let c = clusterStep; c < gw - clusterStep; c += clusterStep) {
         const idx = r * gw + c;
         if (isBuildingGrid[idx]) continue;
+
         const h = heightsFiltered[idx] || 0;
         const red = mesh.colors[idx * 3] ?? 0.5;
         const green = mesh.colors[idx * 3 + 1] ?? 0.5;
         const blue = mesh.colors[idx * 3 + 2] ?? 0.5;
-        const isGreen = green > red * 1.1 && green > blue * 1.05;
-        if (!isGreen && h > 0.28) {
+        const isGreen = green > red * 1.12 && green > blue * 1.08;
+
+        if (!isGreen && h > 0.32) {
           for (let dr = -1; dr <= 1; dr++) {
             for (let dc = -1; dc <= 1; dc++) {
               const nidx = (r + dr) * gw + (c + dc);
-              isBuildingGrid[nidx] = 1;
-              terrainHeights[nidx] = 0.05;
+              isBuildingGrid[nidx] = 2;
             }
           }
-          surroundingBuildings.push({ centerU: (c + 0.5) / gw, centerV: (r + 0.5) / gh, widthU: 3.5 / gw, heightV: 3.5 / gh, groundRel: 0.05, roofRel: h, avgColor: new THREE.Color(red * 0.9, green * 0.9, blue * 0.9) });
+          surroundingBuildings.push({
+            centerU: (c + 0.5) / gw,
+            centerV: (r + 0.5) / gh,
+            widthU: 3.5 / gw,
+            heightV: 3.5 / gh,
+            groundY: 0.1,
+            roofRel: Math.min(0.6, h),
+            avgColor: new THREE.Color(red * 0.85, green * 0.85, blue * 0.85),
+          });
         }
       }
     }
 
-    for (let r = 1; r < gh - 1; r++) {
-      for (let c = 1; c < gw - 1; c++) {
+    // Build Smooth Terrain Heights (Non-building)
+    for (let r = 0; r < gh; r++) {
+      for (let c = 0; c < gw; c++) {
         const idx = r * gw + c;
-        if (isBuildingGrid[idx]) continue;
-        let sum = 0, count = 0;
-        for (let dr = -1; dr <= 1; dr++) {
-          for (let dc = -1; dc <= 1; dc++) {
-            const nidx = (r + dr) * gw + (c + dc);
-            if (!isBuildingGrid[nidx]) { sum += heightsFiltered[nidx] || 0; count++; }
+        if (isBuildingGrid[idx]) {
+          terrainHeights[idx] = 0.1; // Baseline under buildings
+        } else {
+          const rawH = heightsFiltered[idx] || 0;
+          // Smooth non-building ground elevation: subtle variation flat near Y ≈ 0
+          terrainHeights[idx] = Math.max(0.0, Math.min(1.5, rawH * 1.4));
+
+          // Road detection: low saturation, dark asphalt tone
+          const red = mesh.colors[idx * 3] ?? 0.5;
+          const green = mesh.colors[idx * 3 + 1] ?? 0.5;
+          const blue = mesh.colors[idx * 3 + 2] ?? 0.5;
+          if (red < 0.45 && green < 0.45 && blue < 0.45 && Math.abs(red - green) < 0.05 && rawH < 0.2) {
+            roadGrid[idx] = 1;
           }
         }
-        if (count > 0) terrainHeights[idx] = sum / count;
       }
     }
 
-    const buildingsGroup = new THREE.Group();
-    const facadeWallMat = new THREE.MeshStandardMaterial({ color: 0x2e3b4e, roughness: 0.35, metalness: 0.25 });
-    const roofAerialMat = new THREE.MeshStandardMaterial({ map: loadedRgbTextureRef.current || null, color: loadedRgbTextureRef.current ? 0xffffff : 0x94a3b8, roughness: 0.45, metalness: 0.1 });
-    const bldgMultiMaterial = [facadeWallMat, facadeWallMat, roofAerialMat, facadeWallMat, facadeWallMat, facadeWallMat];
-
-    sampleBuildings.forEach((bldg) => {
-      const [bx, by, bw, bh] = bldg.bbox;
-      const cx = (bx + bw / 2) / refW;
-      const cy = (by + bh / 2) / refH;
-      const x3d = (cx - 0.5) * planeSize;
-      const z3d = (cy - 0.5) * planeSize;
-      const w3d = Math.max(2.8, (bw / refW) * planeSize);
-      const d3d = Math.max(2.8, (bh / refH) * planeSize);
-      const baseZ = Math.max(0.1, (bldg.ground_base_z_rel ?? 0.05) * 28 * activeExaggeration);
-      const roofZ = Math.max(baseZ + 2.5, (bldg.rooftop_peak_z_rel ?? 0.4) * 28 * activeExaggeration);
-      const wallHeight = roofZ - baseZ;
-      const bldgGeo = new THREE.BoxGeometry(w3d * 0.98, wallHeight, d3d * 0.98);
-
-      const uvAttr = bldgGeo.attributes.uv;
-      if (uvAttr) {
-        const uMin = bx / refW; const uMax = (bx + bw) / refW;
-        const vMin = 1.0 - (by + bh) / refH; const vMax = 1.0 - by / refH;
-        uvAttr.setXY(16, uMin, vMax); uvAttr.setXY(17, uMax, vMax);
-        uvAttr.setXY(18, uMin, vMin); uvAttr.setXY(19, uMax, vMin);
-        uvAttr.needsUpdate = true;
+    // Spatial Edge-Preserving Smoothing on Non-Building Terrain
+    for (let pass = 0; pass < 2; pass++) {
+      for (let r = 1; r < gh - 1; r++) {
+        for (let c = 1; c < gw - 1; c++) {
+          const idx = r * gw + c;
+          if (isBuildingGrid[idx]) continue;
+          let sum = 0, count = 0;
+          for (let dr = -1; dr <= 1; dr++) {
+            for (let dc = -1; dc <= 1; dc++) {
+              const nidx = (r + dr) * gw + (c + dc);
+              if (!isBuildingGrid[nidx]) {
+                sum += terrainHeights[nidx];
+                count++;
+              }
+            }
+          }
+          if (count > 0) terrainHeights[idx] = sum / count;
+        }
       }
+    }
 
-      const bldgMesh = new THREE.Mesh(bldgGeo, bldgMultiMaterial);
-      bldgMesh.position.set(x3d, baseZ + wallHeight / 2, z3d);
-      bldgMesh.castShadow = true; bldgMesh.receiveShadow = true;
-      bldgMesh.userData = { buildingId: bldg.id, buildingName: bldg.name };
-
-      const edgesGeo = new THREE.EdgesGeometry(bldgGeo);
-      const lineMat = new THREE.LineBasicMaterial({ color: bldg.id === selectedBuilding?.id ? 0x10b981 : 0x38bdf8, linewidth: 2 });
-      const edgesMesh = new THREE.LineSegments(edgesGeo, lineMat);
-      bldgMesh.add(edgesMesh);
-
-      if (wallHeight > 6) {
-        const roofDetailGeo = new THREE.BoxGeometry(w3d * 0.35, 1.4, d3d * 0.35);
-        const roofDetailMat = new THREE.MeshStandardMaterial({ color: 0x64748b, roughness: 0.3, metalness: 0.3 });
-        const roofDetailMesh = new THREE.Mesh(roofDetailGeo, roofDetailMat);
-        roofDetailMesh.position.set(0, wallHeight / 2 + 0.7, 0);
-        roofDetailMesh.castShadow = true;
-        bldgMesh.add(roofDetailMesh);
-      }
-      buildingsGroup.add(bldgMesh);
-    });
-
-    surroundingBuildings.forEach((sb) => {
-      const x3d = (sb.centerU - 0.5) * planeSize; const z3d = (sb.centerV - 0.5) * planeSize;
-      const w3d = Math.max(2.2, sb.widthU * planeSize); const d3d = Math.max(2.2, sb.heightV * planeSize);
-      const baseZ = Math.max(0.1, sb.groundRel * 28 * activeExaggeration);
-      const roofZ = Math.max(baseZ + 2.0, sb.roofRel * 28 * activeExaggeration);
-      const wallHeight = roofZ - baseZ;
-      const sGeo = new THREE.BoxGeometry(w3d, wallHeight, d3d);
-      const sMat = new THREE.MeshStandardMaterial({ color: sb.avgColor.getHex() || 0x334155, roughness: 0.45, metalness: 0.15 });
-      const sMesh = new THREE.Mesh(sGeo, sMat);
-      sMesh.position.set(x3d, baseZ + wallHeight / 2, z3d);
-      sMesh.castShadow = true; sMesh.receiveShadow = true;
-      const sEdgesGeo = new THREE.EdgesGeometry(sGeo);
-      const sEdgesMesh = new THREE.LineSegments(sEdgesGeo, new THREE.LineBasicMaterial({ color: 0x475569 }));
-      sMesh.add(sEdgesMesh);
-      buildingsGroup.add(sMesh);
-    });
-
-    sceneRoot.add(buildingsGroup);
-    buildingsGroupRef.current = buildingsGroup;
-
-    const planeGeo = new THREE.PlaneGeometry(planeSize, (planeSize * gh) / gw, gw - 1, gh - 1);
+    // --- LAYER 1 MESH: TERRAIN ---
+    const planeGeo = new THREE.PlaneGeometry(WORLD_WIDTH, WORLD_DEPTH, gw - 1, gh - 1);
     planeGeo.rotateX(-Math.PI / 2);
     const posAttr = planeGeo.attributes.position;
     const meshColors = new Float32Array(posAttr.count * 3);
     const heatmapColors = new Float32Array(posAttr.count * 3);
 
     for (let i = 0; i < posAttr.count; i++) {
-      const hTerrain = terrainHeights[i] || 0;
-      const hRaw = heightsFiltered[i] || 0;
-      posAttr.setY(i, hTerrain * 28.0 * activeExaggeration);
-      const r = mesh.colors[i * 3] ?? 0.5; const g = mesh.colors[i * 3 + 1] ?? 0.5; const b = mesh.colors[i * 3 + 2] ?? 0.5;
+      posAttr.setY(i, showTerrainLayer ? terrainHeights[i] : 0.0);
+      const r = mesh.colors[i * 3] ?? 0.5;
+      const g = mesh.colors[i * 3 + 1] ?? 0.5;
+      const b = mesh.colors[i * 3 + 2] ?? 0.5;
       meshColors[i * 3] = r; meshColors[i * 3 + 1] = g; meshColors[i * 3 + 2] = b;
-      const hm = getTurboColor(Math.min(1.0, Math.max(0.0, hRaw)));
+
+      const hm = getTurboColor(Math.min(1.0, Math.max(0.0, heightsFiltered[i] || 0)));
       heatmapColors[i * 3] = hm.r; heatmapColors[i * 3 + 1] = hm.g; heatmapColors[i * 3 + 2] = hm.b;
     }
     planeGeo.setAttribute("color", new THREE.BufferAttribute(meshColors, 3));
     planeGeo.computeVertexNormals();
 
-    const meshMat = new THREE.MeshStandardMaterial({ map: loadedRgbTextureRef.current || null, vertexColors: !loadedRgbTextureRef.current, roughness: 0.55, metalness: 0.05, side: THREE.DoubleSide });
-    const terrainMesh = new THREE.Mesh(planeGeo, meshMat);
-    terrainMesh.receiveShadow = true; terrainMesh.castShadow = true;
+    const neutralTerrainMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, roughness: 0.6, metalness: 0.1 });
+    const rgbTerrainMat = new THREE.MeshStandardMaterial({
+      map: useRgbTextures ? loadedRgbTextureRef.current || null : null,
+      vertexColors: !useRgbTextures || !loadedRgbTextureRef.current,
+      roughness: 0.55,
+      metalness: 0.05,
+      side: THREE.DoubleSide,
+    });
+
+    const terrainMesh = new THREE.Mesh(planeGeo, useDebugMaterials ? neutralTerrainMat : rgbTerrainMat);
+    terrainMesh.receiveShadow = true;
+    terrainMesh.castShadow = true;
+    terrainMesh.visible = showTerrainLayer;
     sceneRoot.add(terrainMesh);
     terrainMeshRef.current = terrainMesh;
 
+    // --- LAYER 2: BUILDINGS (MAIN & SURROUNDING) ---
+    const buildingsGroup = new THREE.Group();
+
+    const facadeWallMat = useDebugMaterials
+      ? new THREE.MeshStandardMaterial({ color: 0x64748b, roughness: 0.5 })
+      : new THREE.MeshStandardMaterial({ color: 0x2e3b4e, roughness: 0.35, metalness: 0.25 });
+
+    const roofAerialMat = useDebugMaterials
+      ? new THREE.MeshStandardMaterial({ color: 0x94a3b8, roughness: 0.5 })
+      : new THREE.MeshStandardMaterial({
+          map: useRgbTextures ? loadedRgbTextureRef.current || null : null,
+          color: (useRgbTextures && loadedRgbTextureRef.current) ? 0xffffff : 0x94a3b8,
+          roughness: 0.45,
+          metalness: 0.1,
+        });
+
+    const bldgMultiMaterial = [facadeWallMat, facadeWallMat, roofAerialMat, facadeWallMat, facadeWallMat, facadeWallMat];
+
+    let cDim = { w: 0, d: 0, h: 0 };
+    let wDim = { w: 0, d: 0, h: 0 };
+    let eDim = { w: 0, d: 0, h: 0 };
+
+    if (showMainBuildingsLayer) {
+      sampleBuildings.forEach((bldg) => {
+        const [bx, by, bw, bh] = bldg.bbox;
+        const cx = (bx + bw / 2) / refW;
+        const cy = (by + bh / 2) / refH;
+        const x3d = (cx - 0.5) * WORLD_WIDTH;
+        const z3d = (cy - 0.5) * WORLD_DEPTH;
+        const w3d = Math.max(3.2, (bw / refW) * WORLD_WIDTH);
+        const d3d = Math.max(3.2, (bh / refH) * WORLD_DEPTH);
+
+        // Ground baseline & relative visual roof height
+        const groundY = bldg.ground_base_z_rel ? Math.max(0.1, bldg.ground_base_z_rel * 1.5) : 0.1;
+        const roofPeak = bldg.rooftop_peak_z_rel ?? 0.4;
+        let wallHeight = Math.max(4.0, (roofPeak - (bldg.ground_base_z_rel ?? 0.05)) * 36.0 * activeExaggeration);
+
+        // Sanity Check Guard
+        if (wallHeight > WORLD_WIDTH * 0.75) {
+          console.warn(`MALFORMED_RECONSTRUCTION_OBJECT: ${bldg.name} height ${wallHeight} exceeds 75% scene width! Clamping to 25.0`);
+          malformedCount++;
+          wallHeight = 25.0;
+        }
+
+        const bldgGeo = new THREE.BoxGeometry(w3d * 0.98, wallHeight, d3d * 0.98);
+
+        // Map top roof face UV to exact cropped aerial bounding box
+        const uvAttr = bldgGeo.attributes.uv;
+        if (uvAttr) {
+          const uMin = bx / refW; const uMax = (bx + bw) / refW;
+          const vMin = 1.0 - (by + bh) / refH; const vMax = 1.0 - by / refH;
+          uvAttr.setXY(16, uMin, vMax); uvAttr.setXY(17, uMax, vMax);
+          uvAttr.setXY(18, uMin, vMin); uvAttr.setXY(19, uMax, vMin);
+          uvAttr.needsUpdate = true;
+        }
+
+        const bldgMesh = new THREE.Mesh(bldgGeo, bldgMultiMaterial);
+        bldgMesh.position.set(x3d, groundY + wallHeight / 2, z3d);
+        bldgMesh.castShadow = true;
+        bldgMesh.receiveShadow = true;
+        bldgMesh.userData = { buildingId: bldg.id, buildingName: bldg.name };
+
+        const edgesGeo = new THREE.EdgesGeometry(bldgGeo);
+        const lineMat = new THREE.LineBasicMaterial({
+          color: bldg.id === selectedBuilding?.id ? 0x10b981 : 0x38bdf8,
+          linewidth: 2,
+        });
+        const edgesMesh = new THREE.LineSegments(edgesGeo, lineMat);
+        bldgMesh.add(edgesMesh);
+
+        if (wallHeight > 8.0) {
+          const roofDetailGeo = new THREE.BoxGeometry(w3d * 0.35, 1.2, d3d * 0.35);
+          const roofDetailMat = new THREE.MeshStandardMaterial({ color: 0x64748b, roughness: 0.3, metalness: 0.3 });
+          const roofDetailMesh = new THREE.Mesh(roofDetailGeo, roofDetailMat);
+          roofDetailMesh.position.set(0, wallHeight / 2 + 0.6, 0);
+          roofDetailMesh.castShadow = true;
+          bldgMesh.add(roofDetailMesh);
+        }
+
+        buildingsGroup.add(bldgMesh);
+
+        // Record telemetry dims
+        const dimObj = { w: Number(w3d.toFixed(1)), d: Number(d3d.toFixed(1)), h: Number(wallHeight.toFixed(1)) };
+        if (bldg.name.toLowerCase().includes("central")) cDim = dimObj;
+        else if (bldg.name.toLowerCase().includes("west")) wDim = dimObj;
+        else if (bldg.name.toLowerCase().includes("east")) eDim = dimObj;
+      });
+    }
+
+    // Surrounding secondary structures
+    if (showSurroundingBuildingsLayer) {
+      surroundingBuildings.forEach((sb) => {
+        const x3d = (sb.centerU - 0.5) * WORLD_WIDTH;
+        const z3d = (sb.centerV - 0.5) * WORLD_DEPTH;
+        const w3d = Math.max(2.4, sb.widthU * WORLD_WIDTH);
+        const d3d = Math.max(2.4, sb.heightV * WORLD_DEPTH);
+        const groundY = sb.groundY;
+        let wallHeight = Math.max(3.0, Math.min(16.0, sb.roofRel * 28.0 * activeExaggeration));
+
+        if (wallHeight > WORLD_WIDTH * 0.75) {
+          malformedCount++;
+          wallHeight = 16.0;
+        }
+
+        const sGeo = new THREE.BoxGeometry(w3d, wallHeight, d3d);
+        const sMat = useDebugMaterials
+          ? new THREE.MeshStandardMaterial({ color: 0x475569, roughness: 0.5 })
+          : new THREE.MeshStandardMaterial({ color: sb.avgColor.getHex() || 0x334155, roughness: 0.45, metalness: 0.15 });
+
+        const sMesh = new THREE.Mesh(sGeo, sMat);
+        sMesh.position.set(x3d, groundY + wallHeight / 2, z3d);
+        sMesh.castShadow = true;
+        sMesh.receiveShadow = true;
+
+        const sEdgesGeo = new THREE.EdgesGeometry(sGeo);
+        const sEdgesMesh = new THREE.LineSegments(sEdgesGeo, new THREE.LineBasicMaterial({ color: 0x475569 }));
+        sMesh.add(sEdgesMesh);
+        buildingsGroup.add(sMesh);
+      });
+    }
+
+    sceneRoot.add(buildingsGroup);
+    buildingsGroupRef.current = buildingsGroup;
+
+    // --- LAYER 3: ROADS ---
+    if (showRoadsLayer) {
+      const roadPositions: number[] = [];
+      for (let r = 0; r < gh; r += 2) {
+        for (let c = 0; c < gw; c += 2) {
+          const idx = r * gw + c;
+          if (roadGrid[idx] && !isBuildingGrid[idx]) {
+            const rx = (c / gw - 0.5) * WORLD_WIDTH;
+            const rz = (r / gh - 0.5) * WORLD_DEPTH;
+            const ry = terrainHeights[idx] + 0.04;
+            roadPositions.push(rx, ry, rz);
+          }
+        }
+      }
+
+      if (roadPositions.length > 0) {
+        const roadGeo = new THREE.PlaneGeometry((WORLD_WIDTH / gw) * 2.1, (WORLD_DEPTH / gh) * 2.1);
+        roadGeo.rotateX(-Math.PI / 2);
+        const instancedRoads = new THREE.InstancedMesh(
+          roadGeo,
+          new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.85, side: THREE.DoubleSide }),
+          Math.floor(roadPositions.length / 3)
+        );
+        const dummyMatrix = new THREE.Matrix4();
+        for (let i = 0; i < roadPositions.length / 3; i++) {
+          dummyMatrix.setPosition(roadPositions[i * 3], roadPositions[i * 3 + 1], roadPositions[i * 3 + 2]);
+          instancedRoads.setMatrixAt(i, dummyMatrix);
+        }
+        instancedRoads.instanceMatrix.needsUpdate = true;
+        sceneRoot.add(instancedRoads);
+      }
+    }
+
+    // --- LAYER 4: VEGETATION ---
+    const treesGroup = new THREE.Group();
+    if (showVegetationLayer) {
+      const treePositions: THREE.Vector3[] = [];
+      for (let r = 0; r < gh; r += 4) {
+        for (let c = 0; c < gw; c += 4) {
+          const idx = r * gw + c;
+          if (isBuildingGrid[idx]) continue;
+          const red = mesh.colors[idx * 3] ?? 0.5;
+          const green = mesh.colors[idx * 3 + 1] ?? 0.5;
+          const blue = mesh.colors[idx * 3 + 2] ?? 0.5;
+          const rawH = terrainHeights[idx] || 0.0;
+          if (green > red * 1.12 && green > blue * 1.08 && rawH < 1.0 && (r * c) % 7 === 0) {
+            treePositions.push(new THREE.Vector3((c / gw - 0.5) * WORLD_WIDTH, rawH, (r / gh - 0.5) * WORLD_DEPTH));
+          }
+        }
+      }
+
+      if (treePositions.length > 0) {
+        const treeTrunkGeo = new THREE.CylinderGeometry(0.3, 0.45, 2.4, 6); treeTrunkGeo.translate(0, 1.2, 0);
+        const treeLeavesGeo = new THREE.ConeGeometry(1.6, 3.2, 6); treeLeavesGeo.translate(0, 3.6, 0);
+        const instancedTrunks = new THREE.InstancedMesh(
+          treeTrunkGeo,
+          new THREE.MeshStandardMaterial({ color: 0x78350f, roughness: 0.9 }),
+          treePositions.length
+        );
+        const instancedLeaves = new THREE.InstancedMesh(
+          treeLeavesGeo,
+          new THREE.MeshStandardMaterial({ color: 0x22c55e, roughness: 0.5 }),
+          treePositions.length
+        );
+        const dummyMatrix = new THREE.Matrix4();
+        treePositions.forEach((pos, i) => {
+          dummyMatrix.setPosition(pos.x, pos.y, pos.z);
+          instancedTrunks.setMatrixAt(i, dummyMatrix);
+          instancedLeaves.setMatrixAt(i, dummyMatrix);
+        });
+        instancedTrunks.instanceMatrix.needsUpdate = true;
+        instancedLeaves.instanceMatrix.needsUpdate = true;
+        treesGroup.add(instancedTrunks);
+        treesGroup.add(instancedLeaves);
+      }
+    }
+    sceneRoot.add(treesGroup);
+    treesGroupRef.current = treesGroup;
+
+    // --- DECOUPLED VISUALIZATION MODES (RAW DEPTH / WIREFRAME / VOXEL / POINTS) ---
     const rawPlaneGeo = planeGeo.clone();
     const rawPosAttr = rawPlaneGeo.attributes.position;
-    for (let i = 0; i < rawPosAttr.count; i++) rawPosAttr.setY(i, (heightsFiltered[i] || 0) * 28.0 * activeExaggeration);
+    for (let i = 0; i < rawPosAttr.count; i++) {
+      rawPosAttr.setY(i, (heightsFiltered[i] || 0) * 28.0 * activeExaggeration);
+    }
     rawPlaneGeo.computeVertexNormals();
 
     const depthMat = new THREE.MeshStandardMaterial({ map: loadedDepthTextureRef.current || null, vertexColors: !loadedDepthTextureRef.current, roughness: 0.5, side: THREE.DoubleSide });
@@ -813,42 +1046,9 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     sceneRoot.add(hmMesh);
     heatmapMeshRef.current = hmMesh;
 
-    const treesGroup = new THREE.Group();
-    const treePositions: THREE.Vector3[] = [];
-    for (let r = 0; r < gh; r += 4) {
-      for (let c = 0; c < gw; c += 4) {
-        const idx = r * gw + c;
-        if (isBuildingGrid[idx]) continue;
-        const red = mesh.colors[idx * 3] ?? 0.5; const green = mesh.colors[idx * 3 + 1] ?? 0.5; const blue = mesh.colors[idx * 3 + 2] ?? 0.5;
-        const rawH = terrainHeights[idx] || 0.0;
-        if (green > red * 1.12 && green > blue * 1.08 && rawH < 0.35 && (r * c) % 7 === 0) {
-          treePositions.push(new THREE.Vector3((c / gw - 0.5) * planeSize, rawH * 28.0 * activeExaggeration, (r / gh - 0.5) * planeSize));
-        }
-      }
-    }
-
-    if (treePositions.length > 0) {
-      const treeTrunkGeo = new THREE.CylinderGeometry(0.3, 0.45, 2.4, 6); treeTrunkGeo.translate(0, 1.2, 0);
-      const treeLeavesGeo = new THREE.ConeGeometry(1.6, 3.2, 6); treeLeavesGeo.translate(0, 3.6, 0);
-      const instancedTrunks = new THREE.InstancedMesh(treeTrunkGeo, new THREE.MeshStandardMaterial({ color: 0x78350f, roughness: 0.9 }), treePositions.length);
-      const instancedLeaves = new THREE.InstancedMesh(treeLeavesGeo, new THREE.MeshStandardMaterial({ color: 0x22c55e, roughness: 0.5 }), treePositions.length);
-      const dummyMatrix = new THREE.Matrix4();
-      treePositions.forEach((pos, i) => {
-        dummyMatrix.setPosition(pos.x, pos.y, pos.z);
-        instancedTrunks.setMatrixAt(i, dummyMatrix);
-        instancedLeaves.setMatrixAt(i, dummyMatrix);
-      });
-      instancedTrunks.instanceMatrix.needsUpdate = true;
-      instancedLeaves.instanceMatrix.needsUpdate = true;
-      treesGroup.add(instancedTrunks);
-      treesGroup.add(instancedLeaves);
-    }
-    sceneRoot.add(treesGroup);
-    treesGroupRef.current = treesGroup;
-
     const voxelGroup = new THREE.Group();
     const vxCols = Math.min(56, gw); const vxRows = Math.min(56, gh);
-    const blockWidth = planeSize / vxCols; const blockDepth = planeSize / vxRows;
+    const blockWidth = WORLD_WIDTH / vxCols; const blockDepth = WORLD_DEPTH / vxRows;
     const instancedVoxels = new THREE.InstancedMesh(new THREE.BoxGeometry(blockWidth * 0.94, 1.0, blockDepth * 0.94).translate(0, 0.5, 0), new THREE.MeshStandardMaterial({ roughness: 0.55, metalness: 0.12 }), vxCols * vxRows);
     const dummyMatrix = new THREE.Matrix4(); const colorObj = new THREE.Color();
     let voxelIndex = 0;
@@ -862,7 +1062,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
         else if (red < 0.35 && green < 0.35 && blue < 0.35 && rawH < 0.18) colorObj.setHex(0x334155);
         else colorObj.setRGB(red * 0.95, green * 0.95, blue * 0.95);
         dummyMatrix.makeScale(1.0, quantizedH, 1.0);
-        dummyMatrix.setPosition((c / vxCols - 0.5) * planeSize + blockWidth / 2, 0.0, (r / vxRows - 0.5) * planeSize + blockDepth / 2);
+        dummyMatrix.setPosition((c / vxCols - 0.5) * WORLD_WIDTH + blockWidth / 2, 0.0, (r / vxRows - 0.5) * WORLD_DEPTH + blockDepth / 2);
         instancedVoxels.setMatrixAt(voxelIndex, dummyMatrix);
         instancedVoxels.setColorAt(voxelIndex, colorObj);
         voxelIndex++;
@@ -881,9 +1081,9 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     const colArray = new Float32Array(pCount * 3);
     for (let i = 0; i < pCount; i++) {
       const r = Math.floor(i / gw); const c = i % gw; const h = heightsFiltered[i] || 0;
-      posArray[i * 3] = (c / gw - 0.5) * planeSize;
+      posArray[i * 3] = (c / gw - 0.5) * WORLD_WIDTH;
       posArray[i * 3 + 1] = h * 28.0 * activeExaggeration;
-      posArray[i * 3 + 2] = (r / gh - 0.5) * planeSize;
+      posArray[i * 3 + 2] = (r / gh - 0.5) * WORLD_DEPTH;
       colArray[i * 3] = mesh.colors[i * 3] ?? 0.5;
       colArray[i * 3 + 1] = mesh.colors[i * 3 + 1] ?? 0.5;
       colArray[i * 3 + 2] = mesh.colors[i * 3 + 2] ?? 0.5;
@@ -895,8 +1095,29 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     sceneRoot.add(pts);
     pointCloudPointsRef.current = pts;
 
+    // Update Telemetry Panel state
+    setReconTelemetry({
+      sceneW: Number(WORLD_WIDTH.toFixed(1)),
+      sceneD: Number(WORLD_DEPTH.toFixed(1)),
+      sceneH: 25.0,
+      terrainW: Number(WORLD_WIDTH.toFixed(1)),
+      terrainD: Number(WORLD_DEPTH.toFixed(1)),
+      terrainH: 1.5,
+      centralW: cDim.w, centralD: cDim.d, centralH: cDim.h,
+      westW: wDim.w, westD: wDim.d, westH: wDim.h,
+      eastW: eDim.w, eastD: eDim.d, eastH: eDim.h,
+      p10: Number(p10Val.toFixed(3)),
+      p50: Number(p50Val.toFixed(3)),
+      p90: Number(p90Val.toFixed(3)),
+      malformedObjects: malformedCount,
+    });
+
     fitCameraToScene();
-  }, [mesh, sampleBuildings, activeExaggeration, getEdgePreservedHeights, depthShape, fitCameraToScene]);
+  }, [
+    mesh, sampleBuildings, activeExaggeration, getEdgePreservedHeights, depthShape, fitCameraToScene,
+    showTerrainLayer, showMainBuildingsLayer, showSurroundingBuildingsLayer, showRoadsLayer, showVegetationLayer,
+    useRgbTextures, useDebugMaterials
+  ]);
 
   useEffect(() => {
     if (terrainMeshRef.current) terrainMeshRef.current.visible = renderMode === "mesh";
@@ -1003,18 +1224,59 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
         <div className="relative">
           <Button size="xs" variant={showAnalysisMenu ? "default" : "ghost"} onClick={() => setShowAnalysisMenu(!showAnalysisMenu)} className="h-6 text-[10px] px-1.5 text-slate-300"><SlidersHorizontal className="w-3 h-3 mr-1" />Analysis<ChevronDown className="w-3 h-3 ml-0.5" /></Button>
           {showAnalysisMenu && (
-            <div className="absolute right-0 top-7 z-30 p-2 bg-[#0F172A]/95 border border-slate-700 rounded-xl shadow-2xl w-44 space-y-1 text-[11px] font-mono-data text-slate-200">
+            <div className="absolute right-0 top-7 z-30 p-2 bg-[#0F172A]/95 border border-slate-700 rounded-xl shadow-2xl w-52 space-y-1 text-[11px] font-mono-data text-slate-200">
               <div className="font-bold border-b border-slate-800 pb-1 text-cyan-300 text-[10px]">Analysis Helpers</div>
-              {[{label: "Ground Grid", state: showGrid, setter: setShowGrid}, {label: "3D Spatial Axes", state: showAxes, setter: setShowAxes}, {label: "Scene Bounding Box", state: showBoundingBox, setter: setShowBoundingBox}, {label: "Performance Telemetry", state: showDebugHud, setter: setShowDebugHud}].map(item => (
+              {[
+                {label: "Ground Grid", state: showGrid, setter: setShowGrid},
+                {label: "3D Spatial Axes", state: showAxes, setter: setShowAxes},
+                {label: "Scene Bounding Box", state: showBoundingBox, setter: setShowBoundingBox},
+                {label: "Perf Telemetry", state: showDebugHud, setter: setShowDebugHud},
+                {label: "Recon Diagnostics", state: showReconstructionPanel, setter: setShowReconstructionPanel}
+              ].map(item => (
                 <button key={item.label} onClick={() => item.setter(!item.state)} className="w-full flex items-center justify-between p-1 hover:bg-slate-800 rounded text-left">
                   <span>{item.label}</span>
                   {item.state && <Check className="w-3.5 h-3.5 text-cyan-400" />}
+                </button>
+              ))}
+
+              <div className="font-bold border-b border-slate-800 pb-1 pt-1.5 text-emerald-400 text-[10px]">Reconstruction Debug</div>
+              {[
+                {label: "Terrain Layer", state: showTerrainLayer, setter: setShowTerrainLayer},
+                {label: "Main Buildings", state: showMainBuildingsLayer, setter: setShowMainBuildingsLayer},
+                {label: "Surrounding Bldgs", state: showSurroundingBuildingsLayer, setter: setShowSurroundingBuildingsLayer},
+                {label: "Roads Layer", state: showRoadsLayer, setter: setShowRoadsLayer},
+                {label: "Vegetation Layer", state: showVegetationLayer, setter: setShowVegetationLayer},
+                {label: "RGB Textures", state: useRgbTextures, setter: setUseRgbTextures},
+                {label: "Debug Materials", state: useDebugMaterials, setter: setUseDebugMaterials}
+              ].map(item => (
+                <button key={item.label} onClick={() => item.setter(!item.state)} className="w-full flex items-center justify-between p-1 hover:bg-slate-800 rounded text-left">
+                  <span>{item.label}</span>
+                  {item.state && <Check className="w-3.5 h-3.5 text-emerald-400" />}
                 </button>
               ))}
             </div>
           )}
         </div>
       </div>
+
+      {showReconstructionPanel && (
+        <div className="absolute top-24 left-3 z-30 p-3 bg-[#0F172A]/95 backdrop-blur-md rounded-xl border border-cyan-500/50 shadow-2xl pointer-events-auto text-[11px] font-mono-data space-y-1 text-slate-200 w-56">
+          <div className="flex justify-between items-center font-bold border-b border-slate-800 pb-1 text-cyan-300">
+            <span>RECONSTRUCTION DIAGNOSTICS</span>
+            <button onClick={() => setShowReconstructionPanel(false)} className="text-slate-400 hover:text-white text-xs">✕</button>
+          </div>
+          <div className="space-y-0.5 text-[10px]">
+            <div className="flex justify-between"><span className="text-slate-400">Scene:</span><span>{reconTelemetry.sceneW} × {reconTelemetry.sceneD} × {reconTelemetry.sceneH}</span></div>
+            <div className="flex justify-between"><span className="text-slate-400">Terrain:</span><span>{reconTelemetry.terrainW} × {reconTelemetry.terrainD} × {reconTelemetry.terrainH}</span></div>
+            <div className="flex justify-between"><span className="text-slate-400">Central:</span><span>{reconTelemetry.centralW} × {reconTelemetry.centralD} × {reconTelemetry.centralH}</span></div>
+            <div className="flex justify-between"><span className="text-slate-400">West:</span><span>{reconTelemetry.westW} × {reconTelemetry.westD} × {reconTelemetry.westH}</span></div>
+            <div className="flex justify-between"><span className="text-slate-400">East:</span><span>{reconTelemetry.eastW} × {reconTelemetry.eastD} × {reconTelemetry.eastH}</span></div>
+            <div className="flex justify-between"><span className="text-slate-400">Depth (P10/50/90):</span><span>{reconTelemetry.p10} / {reconTelemetry.p50} / {reconTelemetry.p90}</span></div>
+            <div className="flex justify-between"><span className="text-slate-400">Scale Mode:</span><span className="text-emerald-400 font-bold">{scaleMode.toUpperCase()}</span></div>
+            <div className="flex justify-between"><span className="text-slate-400">Malformed Objects:</span><span className={reconTelemetry.malformedObjects === 0 ? "text-emerald-400 font-bold" : "text-rose-400 font-bold"}>{reconTelemetry.malformedObjects}</span></div>
+          </div>
+        </div>
+      )}
 
       {isMeasurementMode && (
         <div className="absolute top-24 left-3 z-20 p-2.5 px-3 bg-[#0F172A]/95 border border-emerald-500/50 rounded-xl shadow-2xl backdrop-blur-md font-mono-data text-xs space-y-1">
