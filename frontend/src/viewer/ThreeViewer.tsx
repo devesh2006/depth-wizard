@@ -611,86 +611,132 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     const gw = mesh.grid_width;
     const gh = mesh.grid_height;
     const planeSize = 100.0;
-    const heightsFiltered = getEdgePreservedHeights(mesh);
-
-    // 1. TERRAIN BASE GEOMETRY
-    const planeGeo = new THREE.PlaneGeometry(planeSize, (planeSize * gh) / gw, gw - 1, gh - 1);
-    planeGeo.rotateX(-Math.PI / 2);
-
-    const posAttr = planeGeo.attributes.position;
-    const meshColors = new Float32Array(posAttr.count * 3);
-    const heatmapColors = new Float32Array(posAttr.count * 3);
-
-    for (let i = 0; i < posAttr.count; i++) {
-      const h = heightsFiltered[i] || 0;
-      posAttr.setY(i, h * 28.0 * activeExaggeration);
-
-      const r = mesh.colors[i * 3] ?? 0.5;
-      const g = mesh.colors[i * 3 + 1] ?? 0.5;
-      const b = mesh.colors[i * 3 + 2] ?? 0.5;
-      meshColors[i * 3] = r; meshColors[i * 3 + 1] = g; meshColors[i * 3 + 2] = b;
-
-      const hm = getTurboColor(Math.min(1.0, Math.max(0.0, h)));
-      heatmapColors[i * 3] = hm.r; heatmapColors[i * 3 + 1] = hm.g; heatmapColors[i * 3 + 2] = hm.b;
-    }
-
-    planeGeo.setAttribute("color", new THREE.BufferAttribute(meshColors, 3));
-    planeGeo.computeVertexNormals();
-
-    // 1A. PBR REALISTIC TERRAIN MESH
-    const meshMat = new THREE.MeshStandardMaterial({
-      map: loadedRgbTextureRef.current || null,
-      vertexColors: !loadedRgbTextureRef.current,
-      roughness: 0.45,
-      metalness: 0.08,
-      side: THREE.DoubleSide,
-    });
-    const terrainMesh = new THREE.Mesh(planeGeo, meshMat);
-    terrainMesh.receiveShadow = true;
-    terrainMesh.castShadow = true;
-    sceneRoot.add(terrainMesh);
-    terrainMeshRef.current = terrainMesh;
-
-    // 1B. DEPTH COLORMAP MESH
-    const depthMat = new THREE.MeshStandardMaterial({
-      map: loadedDepthTextureRef.current || null,
-      vertexColors: !loadedDepthTextureRef.current,
-      roughness: 0.5,
-      side: THREE.DoubleSide,
-    });
-    const depthMesh = new THREE.Mesh(planeGeo, depthMat);
-    depthMesh.visible = false;
-    sceneRoot.add(depthMesh);
-    depthMeshRef.current = depthMesh;
-
-    // 1C. WIREFRAME MESH (Shares planeGeo with polygon offset to prevent z-fighting)
-    const wireMat = new THREE.MeshBasicMaterial({
-      color: 0x00e5ff,
-      wireframe: true,
-      transparent: true,
-      opacity: 0.85,
-      polygonOffset: true,
-      polygonOffsetFactor: -1,
-      polygonOffsetUnits: -1,
-    });
-    const wireMesh = new THREE.Mesh(planeGeo, wireMat);
-    wireMesh.visible = false;
-    sceneRoot.add(wireMesh);
-    wireframeMeshRef.current = wireMesh;
-
-    // 1D. HEATMAP MESH
-    const hmGeo = planeGeo.clone();
-    hmGeo.setAttribute("color", new THREE.BufferAttribute(heatmapColors, 3));
-    const hmMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.4, metalness: 0.2 });
-    const hmMesh = new THREE.Mesh(hmGeo, hmMat);
-    hmMesh.visible = false;
-    sceneRoot.add(hmMesh);
-    heatmapMeshRef.current = hmMesh;
-
-    // 2. EXTRUDED 3D BUILDING STRUCTURES
-    const buildingsGroup = new THREE.Group();
     const refH = depthShape?.[0] ?? 1024;
     const refW = depthShape?.[1] ?? 1024;
+    const heightsFiltered = getEdgePreservedHeights(mesh);
+
+    // -----------------------------------------------------------------
+    // 1. TERRAIN MASKING & BUILDING SEPARATION
+    // -----------------------------------------------------------------
+    const isBuildingGrid = new Uint8Array(gw * gh);
+    const terrainHeights = new Float32Array(heightsFiltered);
+
+    // Mark main building regions & flatten terrain under them
+    sampleBuildings.forEach((bldg) => {
+      const [bx, by, bw, bh] = bldg.bbox;
+      const cMin = Math.max(0, Math.floor((bx / refW) * gw));
+      const cMax = Math.min(gw - 1, Math.ceil(((bx + bw) / refW) * gw));
+      const rMin = Math.max(0, Math.floor((by / refH) * gh));
+      const rMax = Math.min(gh - 1, Math.ceil(((by + bh) / refH) * gh));
+      const groundH = bldg.ground_base_z_rel ?? 0.05;
+
+      for (let r = rMin; r <= rMax; r++) {
+        for (let c = cMin; c <= cMax; c++) {
+          const idx = r * gw + c;
+          isBuildingGrid[idx] = 1;
+          terrainHeights[idx] = groundH;
+        }
+      }
+    });
+
+    // Detect surrounding un-masked high clusters (secondary city structures)
+    const surroundingBuildings: Array<{
+      centerU: number;
+      centerV: number;
+      widthU: number;
+      heightV: number;
+      groundRel: number;
+      roofRel: number;
+      avgColor: THREE.Color;
+    }> = [];
+
+    const clusterSize = 3;
+    for (let r = clusterSize; r < gh - clusterSize; r += clusterSize) {
+      for (let c = clusterSize; c < gw - clusterSize; c += clusterSize) {
+        const idx = r * gw + c;
+        if (isBuildingGrid[idx]) continue;
+
+        const h = heightsFiltered[idx] || 0;
+        const red = mesh.colors[idx * 3] ?? 0.5;
+        const green = mesh.colors[idx * 3 + 1] ?? 0.5;
+        const blue = mesh.colors[idx * 3 + 2] ?? 0.5;
+
+        const isGreen = green > red * 1.1 && green > blue * 1.05;
+        // Non-green elevated structure cluster
+        if (!isGreen && h > 0.28) {
+          for (let dr = -1; dr <= 1; dr++) {
+            for (let dc = -1; dc <= 1; dc++) {
+              const nidx = (r + dr) * gw + (c + dc);
+              isBuildingGrid[nidx] = 1;
+              terrainHeights[nidx] = 0.05;
+            }
+          }
+
+          surroundingBuildings.push({
+            centerU: (c + 0.5) / gw,
+            centerV: (r + 0.5) / gh,
+            widthU: 3.5 / gw,
+            heightV: 3.5 / gh,
+            groundRel: 0.05,
+            roofRel: h,
+            avgColor: new THREE.Color(red * 0.9, green * 0.9, blue * 0.9),
+          });
+        }
+      }
+    }
+
+    // Smooth terrain edges outside building footprints
+    for (let r = 1; r < gh - 1; r++) {
+      for (let c = 1; c < gw - 1; c++) {
+        const idx = r * gw + c;
+        if (isBuildingGrid[idx]) continue;
+
+        let sum = 0;
+        let count = 0;
+        for (let dr = -1; dr <= 1; dr++) {
+          for (let dc = -1; dc <= 1; dc++) {
+            const nidx = (r + dr) * gw + (c + dc);
+            if (!isBuildingGrid[nidx]) {
+              sum += heightsFiltered[nidx] || 0;
+              count++;
+            }
+          }
+        }
+        if (count > 0) {
+          terrainHeights[idx] = sum / count;
+        }
+      }
+    }
+
+    // -----------------------------------------------------------------
+    // 2. EXTRUDED 3D BUILDING STRUCTURES (REALISTIC PBR)
+    // -----------------------------------------------------------------
+    const buildingsGroup = new THREE.Group();
+
+    // Derived Architectural Facade Material for vertical walls
+    const facadeWallMat = new THREE.MeshStandardMaterial({
+      color: 0x2e3b4e,
+      roughness: 0.35,
+      metalness: 0.25,
+    });
+
+    // Top Roof Material with projected aerial RGB image
+    const roofAerialMat = new THREE.MeshStandardMaterial({
+      map: loadedRgbTextureRef.current || null,
+      color: loadedRgbTextureRef.current ? 0xffffff : 0x94a3b8,
+      roughness: 0.45,
+      metalness: 0.1,
+    });
+
+    // Multi-material for 6 box faces: [+X wall, -X wall, +Y roof, -Y base, +Z wall, -Z wall]
+    const bldgMultiMaterial = [
+      facadeWallMat,
+      facadeWallMat,
+      roofAerialMat,
+      facadeWallMat,
+      facadeWallMat,
+      facadeWallMat,
+    ];
 
     sampleBuildings.forEach((bldg) => {
       const [bx, by, bw, bh] = bldg.bbox;
@@ -699,22 +745,31 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
 
       const x3d = (cx - 0.5) * planeSize;
       const z3d = (cy - 0.5) * planeSize;
-      const w3d = Math.max(2.5, (bw / refW) * planeSize);
-      const d3d = Math.max(2.5, (bh / refH) * planeSize);
+      const w3d = Math.max(2.8, (bw / refW) * planeSize);
+      const d3d = Math.max(2.8, (bh / refH) * planeSize);
 
-      const baseZ = Math.max(0.1, bldg.ground_base_z_rel * 28 * activeExaggeration);
-      const roofZ = Math.max(baseZ + 2.0, bldg.rooftop_peak_z_rel * 28 * activeExaggeration);
+      const baseZ = Math.max(0.1, (bldg.ground_base_z_rel ?? 0.05) * 28 * activeExaggeration);
+      const roofZ = Math.max(baseZ + 2.5, (bldg.rooftop_peak_z_rel ?? 0.4) * 28 * activeExaggeration);
       const wallHeight = roofZ - baseZ;
 
       const bldgGeo = new THREE.BoxGeometry(w3d * 0.98, wallHeight, d3d * 0.98);
-      const bldgMat = new THREE.MeshStandardMaterial({
-        map: loadedRgbTextureRef.current || null,
-        color: loadedRgbTextureRef.current ? 0xffffff : 0x00e5ff,
-        roughness: 0.35,
-        metalness: 0.2,
-      });
 
-      const bldgMesh = new THREE.Mesh(bldgGeo, bldgMat);
+      // Adjust top face (+Y) UVs to map top-down aerial image region
+      const uvAttr = bldgGeo.attributes.uv;
+      if (uvAttr) {
+        const uMin = bx / refW;
+        const uMax = (bx + bw) / refW;
+        const vMin = 1.0 - (by + bh) / refH;
+        const vMax = 1.0 - by / refH;
+
+        uvAttr.setXY(16, uMin, vMax);
+        uvAttr.setXY(17, uMax, vMax);
+        uvAttr.setXY(18, uMin, vMin);
+        uvAttr.setXY(19, uMax, vMin);
+        uvAttr.needsUpdate = true;
+      }
+
+      const bldgMesh = new THREE.Mesh(bldgGeo, bldgMultiMaterial);
       bldgMesh.position.set(x3d, baseZ + wallHeight / 2, z3d);
       bldgMesh.castShadow = true;
       bldgMesh.receiveShadow = true;
@@ -730,7 +785,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
 
       if (wallHeight > 6) {
         const roofDetailGeo = new THREE.BoxGeometry(w3d * 0.35, 1.4, d3d * 0.35);
-        const roofDetailMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, roughness: 0.3 });
+        const roofDetailMat = new THREE.MeshStandardMaterial({ color: 0x64748b, roughness: 0.3, metalness: 0.3 });
         const roofDetailMesh = new THREE.Mesh(roofDetailGeo, roofDetailMat);
         roofDetailMesh.position.set(0, wallHeight / 2 + 0.7, 0);
         roofDetailMesh.castShadow = true;
@@ -739,20 +794,138 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
 
       buildingsGroup.add(bldgMesh);
     });
+
+    // Render Surrounding City Buildings (LOD medium detail)
+    surroundingBuildings.forEach((sb) => {
+      const x3d = (sb.centerU - 0.5) * planeSize;
+      const z3d = (sb.centerV - 0.5) * planeSize;
+      const w3d = Math.max(2.2, sb.widthU * planeSize);
+      const d3d = Math.max(2.2, sb.heightV * planeSize);
+
+      const baseZ = Math.max(0.1, sb.groundRel * 28 * activeExaggeration);
+      const roofZ = Math.max(baseZ + 2.0, sb.roofRel * 28 * activeExaggeration);
+      const wallHeight = roofZ - baseZ;
+
+      const sGeo = new THREE.BoxGeometry(w3d, wallHeight, d3d);
+      const sMat = new THREE.MeshStandardMaterial({
+        color: sb.avgColor.getHex() || 0x334155,
+        roughness: 0.45,
+        metalness: 0.15,
+      });
+      const sMesh = new THREE.Mesh(sGeo, sMat);
+      sMesh.position.set(x3d, baseZ + wallHeight / 2, z3d);
+      sMesh.castShadow = true;
+      sMesh.receiveShadow = true;
+
+      const sEdgesGeo = new THREE.EdgesGeometry(sGeo);
+      const sEdgesMesh = new THREE.LineSegments(sEdgesGeo, new THREE.LineBasicMaterial({ color: 0x475569 }));
+      sMesh.add(sEdgesMesh);
+
+      buildingsGroup.add(sMesh);
+    });
+
     sceneRoot.add(buildingsGroup);
     buildingsGroupRef.current = buildingsGroup;
 
-    // 3. GPU INSTANCED VEGETATION TREES
+    // -----------------------------------------------------------------
+    // 3. TERRAIN BASE GEOMETRY (REALISTIC GROUND & ROADS)
+    // -----------------------------------------------------------------
+    const planeGeo = new THREE.PlaneGeometry(planeSize, (planeSize * gh) / gw, gw - 1, gh - 1);
+    planeGeo.rotateX(-Math.PI / 2);
+
+    const posAttr = planeGeo.attributes.position;
+    const meshColors = new Float32Array(posAttr.count * 3);
+    const heatmapColors = new Float32Array(posAttr.count * 3);
+
+    for (let i = 0; i < posAttr.count; i++) {
+      const hTerrain = terrainHeights[i] || 0;
+      const hRaw = heightsFiltered[i] || 0;
+      posAttr.setY(i, hTerrain * 28.0 * activeExaggeration);
+
+      const r = mesh.colors[i * 3] ?? 0.5;
+      const g = mesh.colors[i * 3 + 1] ?? 0.5;
+      const b = mesh.colors[i * 3 + 2] ?? 0.5;
+      meshColors[i * 3] = r; meshColors[i * 3 + 1] = g; meshColors[i * 3 + 2] = b;
+
+      const hm = getTurboColor(Math.min(1.0, Math.max(0.0, hRaw)));
+      heatmapColors[i * 3] = hm.r; heatmapColors[i * 3 + 1] = hm.g; heatmapColors[i * 3 + 2] = hm.b;
+    }
+
+    planeGeo.setAttribute("color", new THREE.BufferAttribute(meshColors, 3));
+    planeGeo.computeVertexNormals();
+
+    // 3A. PBR REALISTIC TERRAIN MESH
+    const meshMat = new THREE.MeshStandardMaterial({
+      map: loadedRgbTextureRef.current || null,
+      vertexColors: !loadedRgbTextureRef.current,
+      roughness: 0.55,
+      metalness: 0.05,
+      side: THREE.DoubleSide,
+    });
+    const terrainMesh = new THREE.Mesh(planeGeo, meshMat);
+    terrainMesh.receiveShadow = true;
+    terrainMesh.castShadow = true;
+    sceneRoot.add(terrainMesh);
+    terrainMeshRef.current = terrainMesh;
+
+    // 3B. RAW DEPTH MESH (For Depth Map mode)
+    const rawPlaneGeo = planeGeo.clone();
+    const rawPosAttr = rawPlaneGeo.attributes.position;
+    for (let i = 0; i < rawPosAttr.count; i++) {
+      rawPosAttr.setY(i, (heightsFiltered[i] || 0) * 28.0 * activeExaggeration);
+    }
+    rawPlaneGeo.computeVertexNormals();
+
+    const depthMat = new THREE.MeshStandardMaterial({
+      map: loadedDepthTextureRef.current || null,
+      vertexColors: !loadedDepthTextureRef.current,
+      roughness: 0.5,
+      side: THREE.DoubleSide,
+    });
+    const depthMesh = new THREE.Mesh(rawPlaneGeo, depthMat);
+    depthMesh.visible = false;
+    sceneRoot.add(depthMesh);
+    depthMeshRef.current = depthMesh;
+
+    // 3C. WIREFRAME MESH
+    const wireMat = new THREE.MeshBasicMaterial({
+      color: 0x00e5ff,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.85,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1,
+    });
+    const wireMesh = new THREE.Mesh(rawPlaneGeo, wireMat);
+    wireMesh.visible = false;
+    sceneRoot.add(wireMesh);
+    wireframeMeshRef.current = wireMesh;
+
+    // 3D. HEATMAP MESH
+    const hmGeo = rawPlaneGeo.clone();
+    hmGeo.setAttribute("color", new THREE.BufferAttribute(heatmapColors, 3));
+    const hmMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.4, metalness: 0.2 });
+    const hmMesh = new THREE.Mesh(hmGeo, hmMat);
+    hmMesh.visible = false;
+    sceneRoot.add(hmMesh);
+    heatmapMeshRef.current = hmMesh;
+
+    // -----------------------------------------------------------------
+    // 4. GPU INSTANCED VEGETATION TREES
+    // -----------------------------------------------------------------
     const treesGroup = new THREE.Group();
     const treePositions: THREE.Vector3[] = [];
 
     for (let r = 0; r < gh; r += 4) {
       for (let c = 0; c < gw; c += 4) {
         const idx = r * gw + c;
+        if (isBuildingGrid[idx]) continue;
+
         const red = mesh.colors[idx * 3] ?? 0.5;
         const green = mesh.colors[idx * 3 + 1] ?? 0.5;
         const blue = mesh.colors[idx * 3 + 2] ?? 0.5;
-        const rawH = heightsFiltered[idx] || 0.0;
+        const rawH = terrainHeights[idx] || 0.0;
 
         const isGreenVegetation = green > red * 1.12 && green > blue * 1.08 && rawH < 0.35;
         if (isGreenVegetation && (r * c) % 7 === 0) {
@@ -791,7 +964,9 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     sceneRoot.add(treesGroup);
     treesGroupRef.current = treesGroup;
 
-    // 4. VOXEL WORLD (ROBLOX / MINECRAFT STYLE BLOCK CITY)
+    // -----------------------------------------------------------------
+    // 5. VOXEL WORLD (ROBLOX / MINECRAFT STYLE BLOCK CITY)
+    // -----------------------------------------------------------------
     const voxelGroup = new THREE.Group();
     const vxCols = Math.min(56, gw);
     const vxRows = Math.min(56, gh);
@@ -847,7 +1022,9 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     sceneRoot.add(voxelGroup);
     voxelGroupRef.current = voxelGroup;
 
-    // 5. POINT CLOUD (USES EXACT SAME WORLD TRANSFORM AS TERRAIN)
+    // -----------------------------------------------------------------
+    // 6. POINT CLOUD (UNPROJECTED CAMERA SPACE)
+    // -----------------------------------------------------------------
     const pGeo = new THREE.BufferGeometry();
     const pCount = mesh.heights.length;
     const posArray = new Float32Array(pCount * 3);
