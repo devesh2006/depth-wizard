@@ -1,0 +1,166 @@
+{
+  "project_name": "DepthWizard — Single-Image Depth-Assisted 3D Reconstruction and Height Estimation (SIH26175)",
+  "app_type": "geospatial_3d_scientific_suite",
+  "theme": {
+    "mode": "dark",
+    "style_archetype": "THE PERFORMANCE PRO / SIGINT GEOSPATIAL CYBER-GLASS",
+    "concept": "Tactical GIS Command Center with high-density data readout, synchronized 2D/Depth/3D inspection panels, and scientific rigor.",
+    "base_background": "#070A0F",
+    "surface_card": "#0F172A",
+    "surface_glass": "rgba(15, 23, 42, 0.75)",
+    "border_color": "rgba(51, 65, 85, 0.6)",
+    "accent_primary": "#00E5FF",
+    "accent_emerald": "#10B981",
+    "accent_amber": "#F59E0B",
+    "accent_rose": "#F43F5E",
+    "text_primary": "#F8FAFC",
+    "text_muted": "#94A3B8"
+  },
+  "typography": {
+    "font_family_heading": "'Outfit', 'Geist Variable', sans-serif",
+    "font_family_body": "'Geist Variable', 'IBM Plex Sans', sans-serif",
+    "font_family_mono": "'JetBrains Mono', 'IBM Plex Mono', monospace",
+    "scale": {
+      "h1_hero": "text-3xl sm:text-4xl lg:text-5xl font-extrabold tracking-tight",
+      "h2_section": "text-xl sm:text-2xl font-bold tracking-tight",
+      "h3_card": "text-lg font-semibold tracking-normal",
+      "body": "text-sm text-slate-300 leading-relaxed",
+      "mono_data": "font-mono text-xs tracking-wide text-cyan-400"
+    }
+  },
+  "colors": {
+    "background": "#070A0F",
+    "card_background": "#0F172A",
+    "panel_glass": "rgba(15, 23, 42, 0.85)",
+    "border": "rgba(51, 65, 85, 0.6)",
+    "primary": "#00E5FF",
+    "primary_glow": "rgba(0, 229, 255, 0.25)",
+    "success": "#10B981",
+    "warning": "#F59E0B",
+    "destructive": "#EF4444",
+    "muted_text": "#94A3B8",
+    "depth_colormaps": {
+      "turbo": "linear-gradient(to right, #30123B, #4682B4, #228B22, #FFD700, #FF4500, #7A0403)",
+      "viridis": "linear-gradient(to right, #440154, #3B528B, #21908C, #5DC863, #FDE725)",
+      "magma": "linear-gradient(to right, #000004, #51127C, #B73779, #FB8861, #FCFDBF)",
+      "grayscale": "linear-gradient(to right, #000000, #FFFFFF)"
+    }
+  },
+  "layout_architecture": {
+    "header_nav": {
+      "type": "Sticky Glass Header (z-50)",
+      "components": [
+        "DepthWizard Brand Badge with Animated Radar / Depth Pulse Icon",
+        "Hero Preset Selector Quick Dropdown (Downtown High-Rise, Drone Campus, Oblique District, Nadir Satellite)",
+        "3-Min SIH Judge Presentation Mode Launcher Button",
+        "Pipeline Mode Badge (Depth Anything V2 Tensor / Geometry Fallback)",
+        "Scientific Disclaimer & Methodology Modal Trigger"
+      ]
+    },
+    "main_container": {
+      "layout": "Flex/Grid Dashboard with Mode Switcher Tabs (Inspector, Calibration, Measurement, Validation, Presentation)",
+      "padding": "p-4 md:p-6 space-y-6"
+    },
+    "hero_presets": [
+      {
+        "id": "downtown_highrise",
+        "title": "Urban High-Rise Downtown",
+        "type": "High-Density Nadir/Oblique",
+        "gt_benchmark_mae": "0.82m",
+        "description": "Dense high-rise commercial zone with LiDAR ground truth height benchmark data",
+        "image_url": "https://images.unsplash.com/photo-1573108724029-4c46571d6490?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNDR8MHwxfHNlYXJjaHwxfHxzYXRlbGxpdGUlMjBhZXJpYWwlMjB2aWV3JTIwYnVpbGRpbmdzJTIwM2QlMjBjaXR5JTIwZHJvbmUlMjB2aWV3fGVufDB8fHx8MTc4Nzk3NjU1OHww&ixlib=rb-4.1.0&q=85"
+      },
+      {
+        "id": "drone_campus",
+        "title": "University Campus Drone View",
+        "type": "Oblique Low-Altitude Drone",
+        "gt_benchmark_mae": "0.45m",
+        "description": "Historic stone structures and campus lawns with detailed elevation profile",
+        "image_url": "https://images.unsplash.com/photo-1787051503167-1a7653c0e94b?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDk1Nzl8MHwxfHNlYXJjaHwzfHxkcm9uZSUyMHZpZXclMjB1bml2ZXJzaXR5JTIwY2FtcHVzJTIwYnVpbGRpbmclMjBhZXJpYWx8ZW58MHx8fHwxNzg3OTc2NTY2fDA&ixlib=rb-4.1.0&q=85"
+      },
+      {
+        "id": "oblique_commercial",
+        "title": "Oblique Commercial District",
+        "type": "30° Angle Commercial Block",
+        "gt_benchmark_mae": "0.68m",
+        "description": "Medium-height commercial complex with defined shadows for calibration testing",
+        "image_url": "https://images.unsplash.com/photo-1558845530-c8963f0c26fa?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNDR8MHwxfHNlYXJjaHw0fHxzYXRlbGxpdGUlMjBhZXJpYWwlMjB2aWV3JTIwYnVpbGRpbmdzJTIwM2QlMjBjaXR5JTIwZHJvbmUlMjB2aWV3fGVufDB8fHx8MTc4Nzk3NjU1OHww&ixlib=rb-4.1.0&q=85"
+      },
+      {
+        "id": "nadir_satellite",
+        "title": "Near-Nadir Satellite Complex",
+        "type": "Orthorectified Satellite Imagery",
+        "gt_benchmark_mae": "1.12m",
+        "description": "Satellite tile capturing multi-tier roof structures and industrial sheds",
+        "image_url": "https://images.unsplash.com/photo-1688199412486-b486eff757da?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNDR8MHwxfHNlYXJjaHwyfHxzYXRlbGxpdGUlMjBhZXJpYWwlMjB2aWV3JTIwYnVpbGRpbmdzJTIwM2QlMjBjaXR5JTIwZHJvbmUlMjB2aWV3fGVufDB8fHx8MTc4Nzk3NjU1OHww&ixlib=rb-4.1.0&q=85"
+      }
+    ],
+    "key_panels": {
+      "tri_panel_inspector": {
+        "panel_1": "Raw Aerial 2D Image + Quality Analysis badge (Blur, Resolution, Angle, Cloud Occlusion)",
+        "panel_2": "Depth Map Viewer + Colormap Selector (Turbo, Viridis, Magma, Grayscale) + .npy Export",
+        "panel_3": "Interactive Three.js 3D Studio (Point Cloud / Mesh / Wireframe / Height Heatmap + Orbit Controls)",
+        "synchronization": "Hovering on 2D image shows crosshair & synchronized normalized depth + 3D marker in real time"
+      },
+      "height_calibration_module": {
+        "modes": [
+          "Reference-Based: User selects building & enters known ground height (e.g., 18.5m)",
+          "Metadata-Assisted: Focal Length + Drone Altitude + Sensor GSD scale calculation",
+          "Terrain-Referenced: Automatic ground plane extraction (RANSAC fitting)",
+          "Relative Depth Mode: Uncalibrated 0-1 normalized depth display with warning label"
+        ]
+      },
+      "building_height_tool": {
+        "features": [
+          "Interactive bounding box/polygon selector over aerial image",
+          "Automatic baseline ground extraction vs building rooftop peak",
+          "Estimated metric height output (m) + Confidence Score (%) + Margin of Uncertainty (±m)",
+          "Building 3D extrusion preview overlay"
+        ]
+      },
+      "validation_dashboard": {
+        "metrics": [
+          "MAE (Mean Absolute Error)",
+          "RMSE (Root Mean Square Error)",
+          "Median Relative Error (%)",
+          "Error Distribution Scatter Plot (Ground Truth LiDAR vs DepthWizard Prediction)"
+        ]
+      },
+      "presentation_mode": {
+        "title": "SIH Judge-Ready 3-Minute Walkthrough",
+        "steps": [
+          "1. Input Image Quality & View Geometry Analysis",
+          "2. Depth Anything V2 Inference & Raw Metric Surface",
+          "3. Scientific Calibration & Baseline Extraction",
+          "4. Interactive 3D Flythrough & Height Segmentation",
+          "5. LiDAR Benchmark Accuracy Verification"
+        ]
+      }
+    }
+  },
+  "3d_rendering_specifications": {
+    "engine": "Three.js / WebGL with Canvas overlay",
+    "render_modes": ["Point Cloud", "Textured Mesh", "Wireframe Terrain", "Height Heatmap"],
+    "features": [
+      "OrbitControls with pan, zoom, rotate, and orthographic/perspective camera toggle",
+      "Predefined Cinematic Flythrough camera animation sequence",
+      "Vertical Height Exaggeration slider (1.0x to 5.0x)",
+      "Dynamic Light Position & Intensity slider",
+      "Vertex color mapping based on colormapped depth or texture projection"
+    ]
+  },
+  "image_urls": {
+    "downtown_highrise": "https://images.unsplash.com/photo-1573108724029-4c46571d6490?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNDR8MHwxfHNlYXJjaHwxfHxzYXRlbGxpdGUlMjBhZXJpYWwlMjB2aWV3JTIwYnVpbGRpbmdzJTIwM2QlMjBjaXR5JTIwZHJvbmUlMjB2aWV3fGVufDB8fHx8MTc4Nzk3NjU1OHww&ixlib=rb-4.1.0&q=85",
+    "drone_campus": "https://images.unsplash.com/photo-1787051503167-1a7653c0e94b?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDk1Nzl8MHwxfHNlYXJjaHwzfHxkcm9uZSUyMHZpZXclMjB1bml2ZXJzaXR5JTIwY2FtcHVzJTIwYnVpbGRpbmclMjBhZXJpYWx8ZW58MHx8fHwxNzg3OTc2NTY2fDA&ixlib=rb-4.1.0&q=85",
+    "oblique_commercial": "https://images.unsplash.com/photo-1558845530-c8963f0c26fa?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNDR8MHwxfHNlYXJjaHw0fHxzYXRlbGxpdGUlMjBhZXJpYWwlMjB2aWV3JTIwYnVpbGRpbmdzJTIwM2QlMjBjaXR5JTIwZHJvbmUlMjB2aWV3fGVufDB8fHx8MTc4Nzk3NjU1OHww&ixlib=rb-4.1.0&q=85",
+    "nadir_satellite": "https://images.unsplash.com/photo-1688199412486-b486eff757da?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNDR8MHwxfHNlYXJjaHwyfHxzYXRlbGxpdGUlMjBhZXJpYWwlMjB2aWV3JTIwYnVpbGRpbmdzJTIwM2QlMjBjaXR5JTIwZHJvbmUlMjB2aWV3fGVufDB8fHx8MTc4Nzk3NjU1OHww&ixlib=rb-4.1.0&q=85"
+  },
+  "instructions_to_main_agent": [
+    "Ensure the layout is robust and ultra-responsive for dark theme SIGINT GIS dashboard aesthetics.",
+    "Implement synchronized crosshair inspection across 2D Image, Depth Colormap, and 3D Canvas views.",
+    "Add 'data-testid' attributes on all major buttons, dropdowns, inputs, sliders, and chart elements for automated testing.",
+    "Include preloaded hero datasets so judges can immediately interact with high-density ground truth benchmarks without requiring immediate manual file uploads.",
+    "Provide raw depth floating point matrix export (.npy simulation / json download) alongside normalized visual color maps.",
+    "Maintain high scientific honesty by showing confidence intervals, nadir warnings, and LiDAR benchmark comparisons."
+  ]
+}

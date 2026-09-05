@@ -1,0 +1,10 @@
+[
+  {
+    "image": "train/rgb/gamus_demo_001.png",
+    "agl_height": "train/agl/gamus_demo_001.npy",
+    "semantic_mask": "train/semantic/gamus_demo_001.png",
+    "depth_unit": "meter",
+    "scene_id": "gamus_demo_001",
+    "split": "train"
+  }
+]

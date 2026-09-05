@@ -1,0 +1,55 @@
+model:
+  name: "da_v2_large_aerial"
+  base_checkpoint: "depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf"
+  param_count: "335M"
+  max_depth_m: 80.0
+  num_semantic_classes: 7
+  out_channels: 1
+
+datasets:
+  gamus:
+    enabled: true
+    root_dir: "dataset/gamus"
+    manifest_file: "dataset/gamus/manifest.json"
+    image_size: [518, 518]
+    semantic_classes:
+      0: "others"
+      1: "ground"
+      2: "low_vegetation"
+      3: "buildings"
+      4: "water"
+      5: "road"
+      6: "tree"
+  metric_depth:
+    enabled: false
+    root_dir: "dataset/metric_depth"
+    manifest_file: "dataset/metric_depth/manifest.json"
+    min_depth_m: 0.5
+    max_depth_m: 500.0
+    image_size: [518, 518]
+
+loss:
+  depth_weight: 1.0
+  agl_weight: 0.2
+  semantic_weight: 0.1
+  silog_alpha: 0.5
+  silog_lambda: 0.85
+
+training:
+  mode: "AERIAL_DOMAIN_ADAPTATION" # ZERO_SHOT, AERIAL_DOMAIN_ADAPTATION, or AERIAL_METRIC_FINE_TUNING
+  batch_size: 2
+  learning_rate: 1.0e-5
+  weight_decay: 1.0e-4
+  epochs: 20
+  warmup_epochs: 2
+  optimizer: "adamw"
+  scheduler: "cosine"
+  mixed_precision: false
+  gradient_accumulation_steps: 4
+  checkpoint_directory: "checkpoints"
+  adaptation_checkpoint_path: "checkpoints/aerial_adaptation/best_adapted_model.pt"
+  metric_checkpoint_path: "checkpoints/metric_finetuned/best_aerial_depth_model.pt"
+  validation_frequency: 1
+  early_stopping_patience: 5
+  random_seed: 42
+  device: "auto"
