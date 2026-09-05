@@ -4,8 +4,6 @@ import type { PointCloudData, MeshHeightfieldData, BuildingMeasurement } from "@
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { 
-  Play, 
-  Pause, 
   RotateCcw, 
   Eye, 
   Compass, 
@@ -18,10 +16,11 @@ import {
   Image as ImageIcon,
   Sparkles,
   Building2,
-  CheckCircle2,
-  Loader2,
   Camera,
-  Layers
+  Layers,
+  Activity,
+  Sliders,
+  ShieldCheck
 } from "lucide-react";
 
 interface ThreeViewerProps {
@@ -39,6 +38,8 @@ interface ThreeViewerProps {
 }
 
 export type RenderMode = "mesh" | "depth" | "heatmap" | "wireframe" | "pointcloud" | "voxel";
+export type ScaleMode = "scientific" | "exploration";
+export type PerformanceTier = "auto" | "low" | "medium" | "high";
 
 export const ThreeViewer: React.FC<ThreeViewerProps> = ({
   pointcloud,
@@ -50,53 +51,52 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
   onSelectBuilding,
   hoverCoordinate,
   depthShape,
-  isLoading = false,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
+  
+  // Controls & Display Options
   const [renderMode, setRenderMode] = useState<RenderMode>("mesh");
+  const [scaleMode, setScaleMode] = useState<ScaleMode>("scientific");
+  const [verticalExaggeration, setVerticalExaggeration] = useState<number>(1.0);
   const [isFlythroughActive, setIsFlythroughActive] = useState<boolean>(false);
-  const [flythroughProgress, setFlythroughProgress] = useState<number>(0);
-  const [verticalExaggeration, setVerticalExaggeration] = useState<number>(1.4);
   const [showAerialThumbnail, setShowAerialThumbnail] = useState<boolean>(true);
-  const [maxSceneHeightMeters, setMaxSceneHeightMeters] = useState<number>(50);
+  const [showDebugHud, setShowDebugHud] = useState<boolean>(false);
+
+  // Telemetry & Debug Stats
+  const [debugStats, setDebugStats] = useState<{ fps: number; drawCalls: number; triangles: number; points: number }>({
+    fps: 60,
+    drawCalls: 0,
+    triangles: 0,
+    points: 0,
+  });
 
   // Hover & Raycast State
   const [hoveredBuilding, setHoveredBuilding] = useState<BuildingMeasurement | null>(null);
   const [hoverTooltip, setHoverTooltip] = useState<{ x: number; y: number; info: string; height?: string } | null>(null);
 
-  // Reconstruction Loading Progress Sequence State
-  const [loadingStep, setLoadingStep] = useState<number>(0);
-
-  // Three.js instances refs
+  // Three.js Core Instances (using refs for zero React re-render overhead)
   const sceneRef = useRef<THREE.Scene | null>(null);
+  const sceneRootRef = useRef<THREE.Group | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
-  const pointsObjectRef = useRef<THREE.Points | null>(null);
-  const meshObjectRef = useRef<THREE.Mesh | null>(null);
-  const depthMeshObjectRef = useRef<THREE.Mesh | null>(null);
-  const wireframeObjectRef = useRef<THREE.Mesh | null>(null);
-  const heatmapObjectRef = useRef<THREE.Mesh | null>(null);
+
+  // Reusable Object References inside sceneRoot
+  const terrainMeshRef = useRef<THREE.Mesh | null>(null);
+  const depthMeshRef = useRef<THREE.Mesh | null>(null);
+  const wireframeMeshRef = useRef<THREE.Mesh | null>(null);
+  const heatmapMeshRef = useRef<THREE.Mesh | null>(null);
+  const pointCloudPointsRef = useRef<THREE.Points | null>(null);
   const voxelGroupRef = useRef<THREE.Group | null>(null);
   const buildingsGroupRef = useRef<THREE.Group | null>(null);
   const treesGroupRef = useRef<THREE.Group | null>(null);
   const cursorMarkerRef = useRef<THREE.Group | null>(null);
   const buildingBoxRef = useRef<THREE.LineSegments | null>(null);
-  const flythroughCurveRef = useRef<THREE.CatmullRomCurve3 | null>(null);
 
-  // Textures
+  // Cached Materials & Textures
   const loadedRgbTextureRef = useRef<THREE.Texture | null>(null);
   const loadedDepthTextureRef = useRef<THREE.Texture | null>(null);
 
-  // Animation & Camera Movement
-  const flythroughT = useRef<number>(0);
-  const animFrameId = useRef<number | null>(null);
-
-  // Interaction refs
-  const isMouseDown = useRef<boolean>(false);
-  const mouseButton = useRef<number>(0); // 0: left (rotate), 2: right (pan)
-  const mousePrev = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
-
-  // Camera Orbit & Target Lerp
+  // Camera Motion Lerp State
   const cameraTarget = useRef<THREE.Vector3>(new THREE.Vector3(0, 0, 0));
   const desiredCameraTarget = useRef<THREE.Vector3>(new THREE.Vector3(0, 0, 0));
   const cameraAngle = useRef<{ theta: number; phi: number; radius: number }>({
@@ -110,45 +110,50 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     radius: 140,
   });
 
-  // Keyboard Navigation state
+  // Flythrough & Animation refs
+  const flythroughCurveRef = useRef<THREE.CatmullRomCurve3 | null>(null);
+  const flythroughT = useRef<number>(0);
+  const animFrameId = useRef<number | null>(null);
+
+  // Interaction state refs
+  const isMouseDown = useRef<boolean>(false);
+  const mouseButton = useRef<number>(0);
+  const mousePrev = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const keysPressed = useRef<{ [key: string]: boolean }>({});
+  const lastRaycastTime = useRef<number>(0);
+  const frameCountRef = useRef<number>(0);
+  const lastFpsCalcTimeRef = useRef<number>(performance.now());
 
-  // Loading animation simulation sequence
-  useEffect(() => {
-    if (isLoading) {
-      setLoadingStep(1);
-      const timer1 = setTimeout(() => setLoadingStep(2), 600);
-      const timer2 = setTimeout(() => setLoadingStep(3), 1200);
-      const timer3 = setTimeout(() => setLoadingStep(4), 1800);
-      const timer4 = setTimeout(() => setLoadingStep(5), 2400);
-      const timer5 = setTimeout(() => setLoadingStep(6), 3000);
-      return () => {
-        clearTimeout(timer1);
-        clearTimeout(timer2);
-        clearTimeout(timer3);
-        clearTimeout(timer4);
-        clearTimeout(timer5);
-      };
-    } else {
-      setLoadingStep(7);
-    }
-  }, [isLoading]);
+  // Active Effective Scale Factor
+  const activeExaggeration = scaleMode === "scientific" ? 1.0 : verticalExaggeration;
 
-  // Update max scene height in meters when selected building or scene changes
-  useEffect(() => {
-    if (selectedBuilding && selectedBuilding.calibrated_height_m) {
-      setMaxSceneHeightMeters(Math.max(40, Math.ceil(selectedBuilding.calibrated_height_m * 1.3)));
-    } else {
-      setMaxSceneHeightMeters(50);
-    }
-  }, [selectedBuilding]);
+  // -----------------------------------------------------------------
+  // AUTO CAMERA FRAMING FUNCTION
+  // -----------------------------------------------------------------
+  const fitCameraToScene = useCallback(() => {
+    if (!sceneRootRef.current || !cameraRef.current) return;
 
-  // Smooth Camera Position Update with Damping / Inertia
+    const box = new THREE.Box3().setFromObject(sceneRootRef.current);
+    if (box.isEmpty()) return;
+
+    const sphere = new THREE.Sphere();
+    box.getBoundingSphere(sphere);
+
+    desiredCameraTarget.current.copy(sphere.center);
+    desiredCameraAngle.current.radius = Math.max(30, Math.min(300, sphere.radius * 2.1));
+    desiredCameraAngle.current.theta = Math.PI / 3.8;
+    desiredCameraAngle.current.phi = Math.PI / 3.4;
+
+    cameraRef.current.near = Math.max(0.1, sphere.radius * 0.01);
+    cameraRef.current.far = Math.max(1000, sphere.radius * 12);
+    cameraRef.current.updateProjectionMatrix();
+  }, []);
+
+  // Update Camera Position smoothly
   const updateCameraPosition = useCallback(() => {
     if (!cameraRef.current || isFlythroughActive) return;
 
-    // Smoothly lerp camera angle & target towards desired values
-    const dt = 0.15; // lerp factor
+    const dt = 0.15; // smooth damping
     cameraAngle.current.theta += (desiredCameraAngle.current.theta - cameraAngle.current.theta) * dt;
     cameraAngle.current.phi += (desiredCameraAngle.current.phi - cameraAngle.current.phi) * dt;
     cameraAngle.current.radius += (desiredCameraAngle.current.radius - cameraAngle.current.radius) * dt;
@@ -165,7 +170,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     cameraRef.current.lookAt(target);
   }, [isFlythroughActive]);
 
-  // Pre-load HD RGB Aerial Texture
+  // Pre-load RGB Aerial Texture
   useEffect(() => {
     if (!imageUrl) return;
     const loader = new THREE.TextureLoader();
@@ -180,11 +185,14 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
         tex.magFilter = THREE.LinearFilter;
         tex.wrapS = THREE.ClampToEdgeWrapping;
         tex.wrapT = THREE.ClampToEdgeWrapping;
-        tex.anisotropy = 16;
+
+        if (rendererRef.current) {
+          tex.anisotropy = Math.min(8, rendererRef.current.capabilities.getMaxAnisotropy());
+        }
         loadedRgbTextureRef.current = tex;
 
-        if (meshObjectRef.current) {
-          const mat = meshObjectRef.current.material as THREE.MeshStandardMaterial;
+        if (terrainMeshRef.current) {
+          const mat = terrainMeshRef.current.material as THREE.MeshStandardMaterial;
           mat.map = tex;
           mat.vertexColors = false;
           mat.needsUpdate = true;
@@ -210,8 +218,8 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
         tex.magFilter = THREE.LinearFilter;
         loadedDepthTextureRef.current = tex;
 
-        if (depthMeshObjectRef.current) {
-          const mat = depthMeshObjectRef.current.material as THREE.MeshStandardMaterial;
+        if (depthMeshRef.current) {
+          const mat = depthMeshRef.current.material as THREE.MeshStandardMaterial;
           mat.map = tex;
           mat.vertexColors = false;
           mat.needsUpdate = true;
@@ -222,23 +230,28 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     );
   }, [depthColormapUrl]);
 
-  // Initialize Three.js Scene & Render Engine
+  // Initialize Core WebGL Scene & Persistent Animation Loop
   useEffect(() => {
     if (!containerRef.current) return;
     const container = containerRef.current;
-    const width = container.clientWidth || 700;
-    const height = container.clientHeight || 550;
+    const width = container.clientWidth || 800;
+    const height = container.clientHeight || 580;
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x070a0f);
-    scene.fog = new THREE.FogExp2(0x070a0f, 0.0018);
+    scene.fog = new THREE.FogExp2(0x070a0f, 0.0016);
     sceneRef.current = scene;
 
+    // Canonical Reconstruction Root
+    const sceneRoot = new THREE.Group();
+    scene.add(sceneRoot);
+    sceneRootRef.current = sceneRoot;
+
     // Perspective Camera
-    const camera = new THREE.PerspectiveCamera(42, width / height, 0.5, 1500);
+    const camera = new THREE.PerspectiveCamera(42, width / height, 0.5, 2000);
     cameraRef.current = camera;
 
-    // WebGL Renderer with High Precision, Shadows, ACES Filmic Tone Mapping
+    // WebGL Renderer
     const renderer = new THREE.WebGLRenderer({ 
       antialias: true, 
       alpha: true, 
@@ -246,7 +259,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
       preserveDrawingBuffer: true
     });
     renderer.setSize(width, height);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.75));
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -256,33 +269,25 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
-    // Realistic Lighting System (Sunlight + Ambient Occlusion + Sky Fill)
+    // Lighting (Sunlight + Sky Fill + Ground Bounce)
     const ambientLight = new THREE.AmbientLight(0xffffff, 0.9);
     scene.add(ambientLight);
 
     const sunLight = new THREE.DirectionalLight(0xfff7ed, 1.6);
     sunLight.position.set(90, 150, 80);
     sunLight.castShadow = true;
-    sunLight.shadow.mapSize.width = 2048;
-    sunLight.shadow.mapSize.height = 2048;
+    sunLight.shadow.mapSize.width = 1024;
+    sunLight.shadow.mapSize.height = 1024;
     sunLight.shadow.bias = -0.0003;
     scene.add(sunLight);
 
-    const skyFill = new THREE.DirectionalLight(0x38bdf8, 0.45);
+    const skyFill = new THREE.DirectionalLight(0x38bdf8, 0.4);
     skyFill.position.set(-90, 70, -90);
     scene.add(skyFill);
 
-    const groundBounce = new THREE.DirectionalLight(0xa3e635, 0.25);
-    groundBounce.position.set(0, -50, 0);
-    scene.add(groundBounce);
-
-    // Floor Base Tray & Grid
+    // Floor Base Tray & Grid Helper
     const trayGeo = new THREE.BoxGeometry(112, 4, 112);
-    const trayMat = new THREE.MeshStandardMaterial({
-      color: 0x1e293b,
-      roughness: 0.85,
-      metalness: 0.15,
-    });
+    const trayMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.85, metalness: 0.15 });
     const trayMesh = new THREE.Mesh(trayGeo, trayMat);
     trayMesh.position.y = -2.1;
     trayMesh.receiveShadow = true;
@@ -292,7 +297,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     gridHelper.position.y = -0.05;
     scene.add(gridHelper);
 
-    // Hover Marker Pin
+    // Cursor Hover Pin
     const markerGroup = new THREE.Group();
     const pinGeo = new THREE.CylinderGeometry(0.2, 0.8, 12, 12);
     const pinMat = new THREE.MeshBasicMaterial({ color: 0x00e5ff });
@@ -311,7 +316,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     scene.add(markerGroup);
     cursorMarkerRef.current = markerGroup;
 
-    // Flythrough Path Spline
+    // Flythrough Spline Path
     const splinePoints = [
       new THREE.Vector3(110, 90, 110),
       new THREE.Vector3(40, 45, 90),
@@ -323,20 +328,11 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     ];
     flythroughCurveRef.current = new THREE.CatmullRomCurve3(splinePoints, true);
 
-    // Initial Camera Setup
-    desiredCameraAngle.current = { theta: Math.PI / 3.8, phi: Math.PI / 3.4, radius: 145 };
-    cameraAngle.current = { ...desiredCameraAngle.current };
-    updateCameraPosition();
-
-    // Keyboard WASD Movement Loop
+    // Keyboard handlers
     const handleKeyDown = (e: KeyboardEvent) => {
       keysPressed.current[e.key.toLowerCase()] = true;
-
-      if (e.key.toLowerCase() === "r") {
-        resetCamera();
-      } else if (e.key === "Escape") {
-        onSelectBuilding?.(null);
-      }
+      if (e.key.toLowerCase() === "r") resetCamera();
+      else if (e.key === "Escape") onSelectBuilding?.(null);
     };
 
     const handleKeyUp = (e: KeyboardEvent) => {
@@ -346,57 +342,50 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     window.addEventListener("keydown", handleKeyDown);
     window.addEventListener("keyup", handleKeyUp);
 
-    // Main Render Animation Loop
+    // SINGLE PERSISTENT RENDER LOOP
     const animate = () => {
       animFrameId.current = requestAnimationFrame(animate);
 
-      // Process WASD Keyboard movement
+      // WASD Flight Navigation
       const moveSpeed = keysPressed.current["shift"] ? 1.8 : 0.8;
       const { theta } = cameraAngle.current;
       const right = new THREE.Vector3(1, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), theta);
       const forward = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(0, 1, 0), theta);
 
-      let moved = false;
-      if (keysPressed.current["w"]) {
-        desiredCameraTarget.current.addScaledVector(forward, moveSpeed);
-        moved = true;
-      }
-      if (keysPressed.current["s"]) {
-        desiredCameraTarget.current.addScaledVector(forward, -moveSpeed);
-        moved = true;
-      }
-      if (keysPressed.current["a"]) {
-        desiredCameraTarget.current.addScaledVector(right, -moveSpeed);
-        moved = true;
-      }
-      if (keysPressed.current["d"]) {
-        desiredCameraTarget.current.addScaledVector(right, moveSpeed);
-        moved = true;
-      }
-      if (keysPressed.current[" "]) {
-        desiredCameraTarget.current.y += moveSpeed;
-        moved = true;
-      }
-      if (keysPressed.current["control"]) {
-        desiredCameraTarget.current.y = Math.max(-5, desiredCameraTarget.current.y - moveSpeed);
-        moved = true;
-      }
+      if (keysPressed.current["w"]) { desiredCameraTarget.current.addScaledVector(forward, moveSpeed); }
+      if (keysPressed.current["s"]) { desiredCameraTarget.current.addScaledVector(forward, -moveSpeed); }
+      if (keysPressed.current["a"]) { desiredCameraTarget.current.addScaledVector(right, -moveSpeed); }
+      if (keysPressed.current["d"]) { desiredCameraTarget.current.addScaledVector(right, moveSpeed); }
+      if (keysPressed.current[" "]) { desiredCameraTarget.current.y += moveSpeed; }
+      if (keysPressed.current["control"]) { desiredCameraTarget.current.y = Math.max(-5, desiredCameraTarget.current.y - moveSpeed); }
 
-      if (moved || isFlythroughActive || true) {
-        updateCameraPosition();
-      }
+      updateCameraPosition();
 
       if (isFlythroughActive && flythroughCurveRef.current && cameraRef.current) {
         flythroughT.current = (flythroughT.current + 0.0015) % 1.0;
-        setFlythroughProgress(Math.round(flythroughT.current * 100));
         const pos = flythroughCurveRef.current.getPointAt(flythroughT.current);
-        const lookTarget = new THREE.Vector3(0, 5 * verticalExaggeration, 0);
         cameraRef.current.position.copy(pos);
-        cameraRef.current.lookAt(lookTarget);
+        cameraRef.current.lookAt(0, 5, 0);
       }
 
       if (rendererRef.current && sceneRef.current && cameraRef.current) {
         rendererRef.current.render(sceneRef.current, cameraRef.current);
+
+        // Debug FPS calculation
+        frameCountRef.current++;
+        const now = performance.now();
+        if (now - lastFpsCalcTimeRef.current >= 1000) {
+          const fps = Math.round((frameCountRef.current * 1000) / (now - lastFpsCalcTimeRef.current));
+          const info = rendererRef.current.info;
+          setDebugStats({
+            fps,
+            drawCalls: info.render.calls,
+            triangles: info.render.triangles,
+            points: info.render.points,
+          });
+          frameCountRef.current = 0;
+          lastFpsCalcTimeRef.current = now;
+        }
       }
     };
     animate();
@@ -420,7 +409,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     };
   }, [updateCameraPosition, isFlythroughActive]);
 
-  // Mouse Orbit, Pan, Zoom, Double-click Focus & Raycasting Interaction
+  // Mouse Interaction (Orbit, Pan, Zoom, Double-click Focus, Raycast Hover)
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -434,31 +423,28 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     const onMouseMove = (e: MouseEvent) => {
       if (!container || !cameraRef.current) return;
 
-      // Handle Mouse Drag Camera Controls
       if (isMouseDown.current && !isFlythroughActive) {
         const dx = e.clientX - mousePrev.current.x;
         const dy = e.clientY - mousePrev.current.y;
         mousePrev.current = { x: e.clientX, y: e.clientY };
 
         if (mouseButton.current === 0 && !e.shiftKey) {
-          // Orbit
           desiredCameraAngle.current.theta -= dx * 0.0075;
-          desiredCameraAngle.current.phi = Math.max(
-            0.08, 
-            Math.min(Math.PI / 2 - 0.02, desiredCameraAngle.current.phi + dy * 0.0075)
-          );
+          desiredCameraAngle.current.phi = Math.max(0.08, Math.min(Math.PI / 2 - 0.02, desiredCameraAngle.current.phi + dy * 0.0075));
         } else {
-          // Pan
           const right = new THREE.Vector3(1, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), cameraAngle.current.theta);
           const forward = new THREE.Vector3(0, 0, 1).applyAxisAngle(new THREE.Vector3(0, 1, 0), cameraAngle.current.theta);
           const panSpeed = cameraAngle.current.radius * 0.0012;
-
           desiredCameraTarget.current.addScaledVector(right, -dx * panSpeed);
           desiredCameraTarget.current.addScaledVector(forward, -dy * panSpeed);
         }
         updateCameraPosition();
       } else {
-        // Handle Hover Raycast & Tooltip
+        // Throttled Raycasting against building meshes only
+        const now = performance.now();
+        if (now - lastRaycastTime.current < 35) return;
+        lastRaycastTime.current = now;
+
         const rect = container.getBoundingClientRect();
         const mouseX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
         const mouseY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
@@ -469,8 +455,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
         if (buildingsGroupRef.current) {
           const intersects = raycaster.intersectObjects(buildingsGroupRef.current.children, true);
           if (intersects.length > 0) {
-            const hitObj = intersects[0].object;
-            const bId = hitObj.userData?.buildingId;
+            const bId = intersects[0].object.userData?.buildingId;
             if (bId) {
               const matchedBldg = sampleBuildings.find((b) => b.id === bId);
               if (matchedBldg) {
@@ -478,7 +463,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
                 setHoverTooltip({
                   x: e.clientX - rect.left,
                   y: e.clientY - rect.top,
-                  info: `${matchedBldg.name}`,
+                  info: matchedBldg.name,
                   height: matchedBldg.calibrated_height_m 
                     ? `${matchedBldg.calibrated_height_m}m` 
                     : `Peak: ${matchedBldg.rooftop_peak_z_rel.toFixed(2)} rel`
@@ -495,8 +480,6 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
 
     const onMouseUp = (e: MouseEvent) => {
       isMouseDown.current = false;
-
-      // Handle Click Object Selection
       if (hoveredBuilding && e.button === 0) {
         onSelectBuilding?.(hoveredBuilding);
         focusBuilding(hoveredBuilding);
@@ -516,12 +499,11 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
         const raycaster = new THREE.Raycaster();
         raycaster.setFromCamera(new THREE.Vector2(mouseX, mouseY), cameraRef.current);
 
-        if (meshObjectRef.current) {
-          const intersects = raycaster.intersectObject(meshObjectRef.current);
+        if (terrainMeshRef.current) {
+          const intersects = raycaster.intersectObject(terrainMeshRef.current);
           if (intersects.length > 0) {
-            const point = intersects[0].point;
-            desiredCameraTarget.current.copy(point);
-            desiredCameraAngle.current.radius = Math.max(35, cameraAngle.current.radius * 0.6);
+            desiredCameraTarget.current.copy(intersects[0].point);
+            desiredCameraAngle.current.radius = Math.max(30, cameraAngle.current.radius * 0.6);
             updateCameraPosition();
           }
         }
@@ -533,10 +515,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
       if (isFlythroughActive) return;
-      desiredCameraAngle.current.radius = Math.max(
-        15, 
-        Math.min(320, desiredCameraAngle.current.radius + e.deltaY * 0.14)
-      );
+      desiredCameraAngle.current.radius = Math.max(15, Math.min(320, desiredCameraAngle.current.radius + e.deltaY * 0.14));
       updateCameraPosition();
     };
 
@@ -567,18 +546,14 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
 
     const x3d = (cx - 0.5) * 100;
     const z3d = (cy - 0.5) * 100;
-    const roofZ = bldg.rooftop_peak_z_rel * 28 * verticalExaggeration;
+    const roofZ = bldg.rooftop_peak_z_rel * 28 * activeExaggeration;
 
     desiredCameraTarget.current.set(x3d, roofZ * 0.5, z3d);
-    desiredCameraAngle.current = {
-      theta: Math.PI / 4,
-      phi: Math.PI / 3.5,
-      radius: 50,
-    };
+    desiredCameraAngle.current = { theta: Math.PI / 4, phi: Math.PI / 3.5, radius: 45 };
     updateCameraPosition();
-  }, [depthShape, verticalExaggeration, updateCameraPosition]);
+  }, [depthShape, activeExaggeration, updateCameraPosition]);
 
-  // Edge-preserving Bilateral Filter to make building facades vertical & roofs sharp
+  // Edge-preserving Bilateral Filter
   const getEdgePreservedHeights = useCallback((meshData: MeshHeightfieldData): Float32Array => {
     const gw = meshData.grid_width;
     const gh = meshData.grid_height;
@@ -602,93 +577,43 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
             const nc = Math.min(gw - 1, Math.max(0, c + dc));
             const nval = raw[nr * gw + nc] || 0;
 
-            if (Math.abs(nval - val) > thresh) {
-              edgeCount++;
-            }
+            if (Math.abs(nval - val) > thresh) edgeCount++;
             maxNeighbor = Math.max(maxNeighbor, nval);
             minNeighbor = Math.min(minNeighbor, nval);
           }
         }
 
-        if (edgeCount >= 3) {
-          out[idx] = val > (maxNeighbor + minNeighbor) / 2 ? maxNeighbor : minNeighbor;
-        } else {
-          out[idx] = val;
-        }
+        out[idx] = edgeCount >= 3 ? (val > (maxNeighbor + minNeighbor) / 2 ? maxNeighbor : minNeighbor) : val;
       }
     }
     return out;
   }, []);
 
-  // Build 3D World (Reconstructed Mesh + Extruded Building Wall Skirts + Instanced Trees + Voxels + Pointcloud)
+  // -----------------------------------------------------------------
+  // 3D GEOMETRY GENERATION (Runs ONCE when mesh/dataset changes)
+  // -----------------------------------------------------------------
   useEffect(() => {
-    const scene = sceneRef.current;
-    if (!scene) return;
+    const sceneRoot = sceneRootRef.current;
+    if (!sceneRoot || !mesh || mesh.heights.length === 0) return;
 
-    // Dispose Previous Objects
-    const disposeGroup = (grp: THREE.Group | null) => {
-      if (!grp) return;
-      scene.remove(grp);
-      grp.traverse((child) => {
-        if ((child as THREE.Mesh).geometry) (child as THREE.Mesh).geometry.dispose();
-        if ((child as THREE.Mesh).material) {
-          const mat = (child as THREE.Mesh).material;
-          if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
-          else mat.dispose();
-        }
-      });
-    };
-
-    disposeGroup(voxelGroupRef.current);
-    voxelGroupRef.current = null;
-
-    disposeGroup(buildingsGroupRef.current);
-    buildingsGroupRef.current = null;
-
-    disposeGroup(treesGroupRef.current);
-    treesGroupRef.current = null;
-
-    if (pointsObjectRef.current) {
-      scene.remove(pointsObjectRef.current);
-      pointsObjectRef.current.geometry.dispose();
-      (pointsObjectRef.current.material as THREE.Material).dispose();
-      pointsObjectRef.current = null;
+    // Clear Previous Scene Children
+    while (sceneRoot.children.length > 0) {
+      const child = sceneRoot.children[0];
+      sceneRoot.remove(child);
+      if ((child as THREE.Mesh).geometry) (child as THREE.Mesh).geometry.dispose();
+      if ((child as THREE.Mesh).material) {
+        const mat = (child as THREE.Mesh).material;
+        if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+        else mat.dispose();
+      }
     }
-    if (meshObjectRef.current) {
-      scene.remove(meshObjectRef.current);
-      meshObjectRef.current.geometry.dispose();
-      (meshObjectRef.current.material as THREE.Material).dispose();
-      meshObjectRef.current = null;
-    }
-    if (depthMeshObjectRef.current) {
-      scene.remove(depthMeshObjectRef.current);
-      depthMeshObjectRef.current.geometry.dispose();
-      (depthMeshObjectRef.current.material as THREE.Material).dispose();
-      depthMeshObjectRef.current = null;
-    }
-    if (wireframeObjectRef.current) {
-      scene.remove(wireframeObjectRef.current);
-      wireframeObjectRef.current.geometry.dispose();
-      (wireframeObjectRef.current.material as THREE.Material).dispose();
-      wireframeObjectRef.current = null;
-    }
-    if (heatmapObjectRef.current) {
-      scene.remove(heatmapObjectRef.current);
-      heatmapObjectRef.current.geometry.dispose();
-      (heatmapObjectRef.current.material as THREE.Material).dispose();
-      heatmapObjectRef.current = null;
-    }
-
-    if (!mesh || mesh.heights.length === 0) return;
 
     const gw = mesh.grid_width;
     const gh = mesh.grid_height;
     const planeSize = 100.0;
     const heightsFiltered = getEdgePreservedHeights(mesh);
 
-    // -------------------------------------------------------------
-    // 1. REALISTIC SMOOTH TEXTURED TERRAIN MESH
-    // -------------------------------------------------------------
+    // 1. TERRAIN BASE GEOMETRY
     const planeGeo = new THREE.PlaneGeometry(planeSize, (planeSize * gh) / gw, gw - 1, gh - 1);
     planeGeo.rotateX(-Math.PI / 2);
 
@@ -698,26 +623,21 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
 
     for (let i = 0; i < posAttr.count; i++) {
       const h = heightsFiltered[i] || 0;
-      posAttr.setY(i, h * 28.0 * verticalExaggeration);
+      posAttr.setY(i, h * 28.0 * activeExaggeration);
 
       const r = mesh.colors[i * 3] ?? 0.5;
       const g = mesh.colors[i * 3 + 1] ?? 0.5;
       const b = mesh.colors[i * 3 + 2] ?? 0.5;
-      meshColors[i * 3] = r;
-      meshColors[i * 3 + 1] = g;
-      meshColors[i * 3 + 2] = b;
+      meshColors[i * 3] = r; meshColors[i * 3 + 1] = g; meshColors[i * 3 + 2] = b;
 
-      const normH = Math.min(1.0, Math.max(0.0, h));
-      const hm = getTurboColor(normH);
-      heatmapColors[i * 3] = hm.r;
-      heatmapColors[i * 3 + 1] = hm.g;
-      heatmapColors[i * 3 + 2] = hm.b;
+      const hm = getTurboColor(Math.min(1.0, Math.max(0.0, h)));
+      heatmapColors[i * 3] = hm.r; heatmapColors[i * 3 + 1] = hm.g; heatmapColors[i * 3 + 2] = hm.b;
     }
 
     planeGeo.setAttribute("color", new THREE.BufferAttribute(meshColors, 3));
     planeGeo.computeVertexNormals();
 
-    // Realistic PBR Material mapped with 2D RGB Texture
+    // 1A. PBR REALISTIC TERRAIN MESH
     const meshMat = new THREE.MeshStandardMaterial({
       map: loadedRgbTextureRef.current || null,
       vertexColors: !loadedRgbTextureRef.current,
@@ -725,32 +645,49 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
       metalness: 0.08,
       side: THREE.DoubleSide,
     });
+    const terrainMesh = new THREE.Mesh(planeGeo, meshMat);
+    terrainMesh.receiveShadow = true;
+    terrainMesh.castShadow = true;
+    sceneRoot.add(terrainMesh);
+    terrainMeshRef.current = terrainMesh;
 
-    const meshObj = new THREE.Mesh(planeGeo.clone(), meshMat);
-    meshObj.receiveShadow = true;
-    meshObj.castShadow = true;
-    meshObj.visible = renderMode === "mesh";
-    scene.add(meshObj);
-    meshObjectRef.current = meshObj;
-
-    // Depth Colormap Mode Mesh
+    // 1B. DEPTH COLORMAP MESH
     const depthMat = new THREE.MeshStandardMaterial({
       map: loadedDepthTextureRef.current || null,
       vertexColors: !loadedDepthTextureRef.current,
       roughness: 0.5,
-      metalness: 0.1,
       side: THREE.DoubleSide,
     });
-    const depthMeshObj = new THREE.Mesh(planeGeo.clone(), depthMat);
-    depthMeshObj.receiveShadow = true;
-    depthMeshObj.castShadow = true;
-    depthMeshObj.visible = renderMode === "depth";
-    scene.add(depthMeshObj);
-    depthMeshObjectRef.current = depthMeshObj;
+    const depthMesh = new THREE.Mesh(planeGeo, depthMat);
+    depthMesh.visible = false;
+    sceneRoot.add(depthMesh);
+    depthMeshRef.current = depthMesh;
 
-    // -------------------------------------------------------------
-    // 2. EXTRUDED 3D BUILDING STRUCTURES (SOLID WALLS & ROOFS)
-    // -------------------------------------------------------------
+    // 1C. WIREFRAME MESH (Shares planeGeo with polygon offset to prevent z-fighting)
+    const wireMat = new THREE.MeshBasicMaterial({
+      color: 0x00e5ff,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.85,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1,
+    });
+    const wireMesh = new THREE.Mesh(planeGeo, wireMat);
+    wireMesh.visible = false;
+    sceneRoot.add(wireMesh);
+    wireframeMeshRef.current = wireMesh;
+
+    // 1D. HEATMAP MESH
+    const hmGeo = planeGeo.clone();
+    hmGeo.setAttribute("color", new THREE.BufferAttribute(heatmapColors, 3));
+    const hmMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.4, metalness: 0.2 });
+    const hmMesh = new THREE.Mesh(hmGeo, hmMat);
+    hmMesh.visible = false;
+    sceneRoot.add(hmMesh);
+    heatmapMeshRef.current = hmMesh;
+
+    // 2. EXTRUDED 3D BUILDING STRUCTURES
     const buildingsGroup = new THREE.Group();
     const refH = depthShape?.[0] ?? 1024;
     const refW = depthShape?.[1] ?? 1024;
@@ -765,14 +702,11 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
       const w3d = Math.max(2.5, (bw / refW) * planeSize);
       const d3d = Math.max(2.5, (bh / refH) * planeSize);
 
-      const baseZ = Math.max(0.1, bldg.ground_base_z_rel * 28 * verticalExaggeration);
-      const roofZ = Math.max(baseZ + 2.0, bldg.rooftop_peak_z_rel * 28 * verticalExaggeration);
+      const baseZ = Math.max(0.1, bldg.ground_base_z_rel * 28 * activeExaggeration);
+      const roofZ = Math.max(baseZ + 2.0, bldg.rooftop_peak_z_rel * 28 * activeExaggeration);
       const wallHeight = roofZ - baseZ;
 
-      // Solid Extruded Building Box
       const bldgGeo = new THREE.BoxGeometry(w3d * 0.98, wallHeight, d3d * 0.98);
-
-      // PBR Material with aerial texture mapping
       const bldgMat = new THREE.MeshStandardMaterial({
         map: loadedRgbTextureRef.current || null,
         color: loadedRgbTextureRef.current ? 0xffffff : 0x00e5ff,
@@ -786,7 +720,6 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
       bldgMesh.receiveShadow = true;
       bldgMesh.userData = { buildingId: bldg.id, buildingName: bldg.name };
 
-      // Building Outline Edges
       const edgesGeo = new THREE.EdgesGeometry(bldgGeo);
       const lineMat = new THREE.LineBasicMaterial({
         color: bldg.id === selectedBuilding?.id ? 0x10b981 : 0x38bdf8,
@@ -795,7 +728,6 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
       const edgesMesh = new THREE.LineSegments(edgesGeo, lineMat);
       bldgMesh.add(edgesMesh);
 
-      // Rooftop Structure Detail (HVAC / Elevator Shaft)
       if (wallHeight > 6) {
         const roofDetailGeo = new THREE.BoxGeometry(w3d * 0.35, 1.4, d3d * 0.35);
         const roofDetailMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, roughness: 0.3 });
@@ -807,18 +739,13 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
 
       buildingsGroup.add(bldgMesh);
     });
-
-    buildingsGroup.visible = renderMode === "mesh" || renderMode === "depth";
-    scene.add(buildingsGroup);
+    sceneRoot.add(buildingsGroup);
     buildingsGroupRef.current = buildingsGroup;
 
-    // -------------------------------------------------------------
-    // 3. GPU INSTANCED VEGETATION (TREES OVER GREEN REGIONS)
-    // -------------------------------------------------------------
+    // 3. GPU INSTANCED VEGETATION TREES
     const treesGroup = new THREE.Group();
     const treePositions: THREE.Vector3[] = [];
 
-    // Detect vegetation pixels from RGB colors
     for (let r = 0; r < gh; r += 4) {
       for (let c = 0; c < gw; c += 4) {
         const idx = r * gw + c;
@@ -831,7 +758,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
         if (isGreenVegetation && (r * c) % 7 === 0) {
           const posX = (c / gw - 0.5) * planeSize;
           const posZ = (r / gh - 0.5) * planeSize;
-          const posY = rawH * 28.0 * verticalExaggeration;
+          const posY = rawH * 28.0 * activeExaggeration;
           treePositions.push(new THREE.Vector3(posX, posY, posZ));
         }
       }
@@ -858,19 +785,13 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
 
       instancedTrunks.instanceMatrix.needsUpdate = true;
       instancedLeaves.instanceMatrix.needsUpdate = true;
-      instancedTrunks.castShadow = true;
-      instancedLeaves.castShadow = true;
-
       treesGroup.add(instancedTrunks);
       treesGroup.add(instancedLeaves);
     }
-    treesGroup.visible = renderMode === "mesh";
-    scene.add(treesGroup);
+    sceneRoot.add(treesGroup);
     treesGroupRef.current = treesGroup;
 
-    // -------------------------------------------------------------
     // 4. VOXEL WORLD (ROBLOX / MINECRAFT STYLE BLOCK CITY)
-    // -------------------------------------------------------------
     const voxelGroup = new THREE.Group();
     const vxCols = Math.min(56, gw);
     const vxRows = Math.min(56, gh);
@@ -880,16 +801,8 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
 
     const blockGeo = new THREE.BoxGeometry(blockWidth * 0.94, 1.0, blockDepth * 0.94);
     blockGeo.translate(0, 0.5, 0);
-
-    const blockMat = new THREE.MeshStandardMaterial({
-      roughness: 0.55,
-      metalness: 0.12,
-      shadowSide: THREE.DoubleSide,
-    });
-
+    const blockMat = new THREE.MeshStandardMaterial({ roughness: 0.55, metalness: 0.12 });
     const instancedVoxels = new THREE.InstancedMesh(blockGeo, blockMat, totalVoxels);
-    instancedVoxels.castShadow = true;
-    instancedVoxels.receiveShadow = true;
 
     const dummyMatrix = new THREE.Matrix4();
     const colorObj = new THREE.Color();
@@ -906,7 +819,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
         const green = mesh.colors[srcIdx * 3 + 1] ?? 0.5;
         const blue = mesh.colors[srcIdx * 3 + 2] ?? 0.5;
 
-        const maxBlockHeight = 32.0 * verticalExaggeration;
+        const maxBlockHeight = 32.0 * activeExaggeration;
         const numSteps = 28;
         const quantizedH = Math.max(0.5, Math.round(rawH * numSteps) / numSteps) * maxBlockHeight;
 
@@ -915,125 +828,89 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
 
         const isGreenVegetation = green > red * 1.12 && green > blue * 1.1 && rawH < 0.35;
         const isDarkRoad = red < 0.35 && green < 0.35 && blue < 0.35 && rawH < 0.18;
-        const isBuilding = rawH >= 0.22 && !isGreenVegetation;
 
-        if (isGreenVegetation) {
-          colorObj.setRGB(0.18 + green * 0.4, 0.65 + green * 0.3, 0.18 + blue * 0.2);
-        } else if (isDarkRoad) {
-          const isCrosswalkLine = (c % 8 === 0 && r % 2 === 0) || (r % 8 === 0 && c % 2 === 0);
-          colorObj.setHex(isCrosswalkLine ? 0xe2e8f0 : 0x334155);
-        } else if (isBuilding) {
-          colorObj.setRGB(0.48 + red * 0.3, 0.52 + green * 0.3, 0.58 + blue * 0.3);
-        } else {
-          colorObj.setRGB(red * 0.95, green * 0.95, blue * 0.95);
-        }
+        if (isGreenVegetation) colorObj.setRGB(0.18 + green * 0.4, 0.65 + green * 0.3, 0.18 + blue * 0.2);
+        else if (isDarkRoad) colorObj.setHex(0x334155);
+        else colorObj.setRGB(red * 0.95, green * 0.95, blue * 0.95);
 
         dummyMatrix.makeScale(1.0, quantizedH, 1.0);
         dummyMatrix.setPosition(posX, 0.0, posZ);
-
         instancedVoxels.setMatrixAt(voxelIndex, dummyMatrix);
         instancedVoxels.setColorAt(voxelIndex, colorObj);
         voxelIndex++;
       }
     }
-
     instancedVoxels.instanceMatrix.needsUpdate = true;
     if (instancedVoxels.instanceColor) instancedVoxels.instanceColor.needsUpdate = true;
-
     voxelGroup.add(instancedVoxels);
-    voxelGroup.visible = renderMode === "voxel";
-    scene.add(voxelGroup);
+    voxelGroup.visible = false;
+    sceneRoot.add(voxelGroup);
     voxelGroupRef.current = voxelGroup;
 
-    // -------------------------------------------------------------
-    // 5. WIREFRAME MESH
-    // -------------------------------------------------------------
-    const wireMat = new THREE.MeshBasicMaterial({
-      color: 0x00e5ff,
-      wireframe: true,
-      transparent: true,
-      opacity: 0.75,
-    });
-    const wireObj = new THREE.Mesh(planeGeo.clone(), wireMat);
-    wireObj.visible = renderMode === "wireframe";
-    scene.add(wireObj);
-    wireframeObjectRef.current = wireObj;
+    // 5. POINT CLOUD (USES EXACT SAME WORLD TRANSFORM AS TERRAIN)
+    const pGeo = new THREE.BufferGeometry();
+    const pCount = mesh.heights.length;
+    const posArray = new Float32Array(pCount * 3);
+    const colArray = new Float32Array(pCount * 3);
 
-    // -------------------------------------------------------------
-    // 6. ELEVATION HEATMAP MESH
-    // -------------------------------------------------------------
-    const hmGeo = planeGeo.clone();
-    hmGeo.setAttribute("color", new THREE.BufferAttribute(heatmapColors, 3));
-    const hmMat = new THREE.MeshStandardMaterial({
-      vertexColors: true,
-      roughness: 0.4,
-      metalness: 0.2,
-    });
-    const hmObj = new THREE.Mesh(hmGeo, hmMat);
-    hmObj.visible = renderMode === "heatmap";
-    scene.add(hmObj);
-    heatmapObjectRef.current = hmObj;
+    for (let i = 0; i < pCount; i++) {
+      const r = Math.floor(i / gw);
+      const c = i % gw;
+      const h = heightsFiltered[i] || 0;
 
-    // -------------------------------------------------------------
-    // 7. POINT CLOUD
-    // -------------------------------------------------------------
-    if (pointcloud && pointcloud.positions.length > 0) {
-      const pGeo = new THREE.BufferGeometry();
-      const posArray = new Float32Array(pointcloud.positions.length);
-      const colArray = new Float32Array(pointcloud.colors.length);
+      posArray[i * 3] = (c / gw - 0.5) * planeSize;
+      posArray[i * 3 + 1] = h * 28.0 * activeExaggeration;
+      posArray[i * 3 + 2] = (r / gh - 0.5) * planeSize;
 
-      for (let i = 0; i < pointcloud.positions.length; i += 3) {
-        posArray[i] = pointcloud.positions[i];
-        posArray[i + 1] = pointcloud.positions[i + 1] * verticalExaggeration;
-        posArray[i + 2] = pointcloud.positions[i + 2];
-
-        colArray[i] = pointcloud.colors[i];
-        colArray[i + 1] = pointcloud.colors[i + 1];
-        colArray[i + 2] = pointcloud.colors[i + 2];
-      }
-
-      pGeo.setAttribute("position", new THREE.BufferAttribute(posArray, 3));
-      pGeo.setAttribute("color", new THREE.BufferAttribute(colArray, 3));
-
-      const pMat = new THREE.PointsMaterial({
-        size: 1.6,
-        vertexColors: true,
-        sizeAttenuation: true,
-      });
-
-      const pts = new THREE.Points(pGeo, pMat);
-      pts.visible = renderMode === "pointcloud";
-      scene.add(pts);
-      pointsObjectRef.current = pts;
+      colArray[i * 3] = mesh.colors[i * 3] ?? 0.5;
+      colArray[i * 3 + 1] = mesh.colors[i * 3 + 1] ?? 0.5;
+      colArray[i * 3 + 2] = mesh.colors[i * 3 + 2] ?? 0.5;
     }
-  }, [pointcloud, mesh, sampleBuildings, verticalExaggeration, renderMode, getEdgePreservedHeights, depthShape, selectedBuilding]);
 
-  // Mode Visibility Switcher
+    pGeo.setAttribute("position", new THREE.BufferAttribute(posArray, 3));
+    pGeo.setAttribute("color", new THREE.BufferAttribute(colArray, 3));
+
+    const pMat = new THREE.PointsMaterial({
+      size: 1.6,
+      vertexColors: true,
+      sizeAttenuation: true,
+    });
+    const pts = new THREE.Points(pGeo, pMat);
+    pts.visible = false;
+    sceneRoot.add(pts);
+    pointCloudPointsRef.current = pts;
+
+    // AUTO CAMERA FRAMING
+    fitCameraToScene();
+  }, [mesh, sampleBuildings, activeExaggeration, getEdgePreservedHeights, depthShape, fitCameraToScene]);
+
+  // -----------------------------------------------------------------
+  // INSTANT ZERO-ALLOCATION MODE SWITCHING
+  // -----------------------------------------------------------------
   useEffect(() => {
-    if (meshObjectRef.current) meshObjectRef.current.visible = renderMode === "mesh";
-    if (depthMeshObjectRef.current) depthMeshObjectRef.current.visible = renderMode === "depth";
+    if (terrainMeshRef.current) terrainMeshRef.current.visible = renderMode === "mesh";
+    if (depthMeshRef.current) depthMeshRef.current.visible = renderMode === "depth";
+    if (wireframeMeshRef.current) wireframeMeshRef.current.visible = renderMode === "wireframe";
+    if (heatmapMeshRef.current) heatmapMeshRef.current.visible = renderMode === "heatmap";
+    if (pointCloudPointsRef.current) pointCloudPointsRef.current.visible = renderMode === "pointcloud";
     if (voxelGroupRef.current) voxelGroupRef.current.visible = renderMode === "voxel";
     if (buildingsGroupRef.current) buildingsGroupRef.current.visible = renderMode === "mesh" || renderMode === "depth";
     if (treesGroupRef.current) treesGroupRef.current.visible = renderMode === "mesh";
-    if (pointsObjectRef.current) pointsObjectRef.current.visible = renderMode === "pointcloud";
-    if (wireframeObjectRef.current) wireframeObjectRef.current.visible = renderMode === "wireframe";
-    if (heatmapObjectRef.current) heatmapObjectRef.current.visible = renderMode === "heatmap";
   }, [renderMode]);
 
-  // Synchronized Hover Cursor Pin Update
+  // Synchronized Hover Cursor Pin
   useEffect(() => {
     if (!cursorMarkerRef.current) return;
     if (hoverCoordinate) {
       const x = (hoverCoordinate.u - 0.5) * 100.0;
       const z = (hoverCoordinate.v - 0.5) * 100.0;
-      const y = hoverCoordinate.relDepth * 28.0 * verticalExaggeration;
-
+      const y = hoverCoordinate.relDepth * 28.0 * activeExaggeration;
       cursorMarkerRef.current.position.set(x, y, z);
       cursorMarkerRef.current.visible = true;
     } else {
       cursorMarkerRef.current.visible = false;
     }
-  }, [hoverCoordinate, verticalExaggeration]);
+  }, [hoverCoordinate, activeExaggeration]);
 
   // Highlight Selected Building 3D Bounding Box
   useEffect(() => {
@@ -1059,8 +936,8 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
       const w3d = (bw / refW) * 100;
       const d3d = (bh / refH) * 100;
 
-      const baseZ = selectedBuilding.ground_base_z_rel * 28 * verticalExaggeration;
-      const roofZ = selectedBuilding.rooftop_peak_z_rel * 28 * verticalExaggeration;
+      const baseZ = selectedBuilding.ground_base_z_rel * 28 * activeExaggeration;
+      const roofZ = selectedBuilding.rooftop_peak_z_rel * 28 * activeExaggeration;
       const h3d = Math.max(2.0, roofZ - baseZ);
 
       const boxGeo = new THREE.BoxGeometry(w3d, h3d, d3d);
@@ -1072,26 +949,20 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
       scene.add(boxLines);
       buildingBoxRef.current = boxLines;
     }
-  }, [selectedBuilding, verticalExaggeration, depthShape]);
+  }, [selectedBuilding, activeExaggeration, depthShape]);
 
-  // Turbo Color helper
+  // Turbo Colormap helper
   function getTurboColor(x: number) {
     const r = 0.1357 + x * (4.61539 - x * (42.6603 - x * (132.131 - x * (161.073 - x * 65.402))));
     const g = 0.0914 + x * (2.19418 + x * (16.4218 - x * (57.4583 - x * (71.3094 - x * 31.764))));
     const b = 0.1067 + x * (12.5925 - x * (60.1097 - x * (109.0745 - x * (88.5061 - x * 26.818))));
-    return {
-      r: Math.min(1, Math.max(0, r)),
-      g: Math.min(1, Math.max(0, g)),
-      b: Math.min(1, Math.max(0, b)),
-    };
+    return { r: Math.min(1, Math.max(0, r)), g: Math.min(1, Math.max(0, g)), b: Math.min(1, Math.max(0, b)) };
   }
 
   // Camera Presets
   const resetCamera = () => {
     setIsFlythroughActive(false);
-    desiredCameraTarget.current.set(0, 0, 0);
-    desiredCameraAngle.current = { theta: Math.PI / 3.8, phi: Math.PI / 3.4, radius: 145 };
-    updateCameraPosition();
+    fitCameraToScene();
   };
 
   const setIsometricView = () => {
@@ -1116,10 +987,10 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
   };
 
   return (
-    <div className="relative w-full h-[580px] rounded-2xl overflow-hidden border border-slate-800 bg-[#070A0F] flex flex-col select-none shadow-2xl">
+    <div className="relative w-full h-[620px] rounded-2xl overflow-hidden border border-slate-800 bg-[#070A0F] flex flex-col select-none shadow-2xl">
       
       {/* ------------------------------------------------------------- */}
-      {/* TOP-LEFT OVERLAY: DepthWizard 3D Header Badge */}
+      {/* TOP-LEFT OVERLAY: Title & Scale Mode Selector */}
       {/* ------------------------------------------------------------- */}
       <div className="absolute top-3 left-3 z-20 flex items-center gap-2.5 p-2 px-3 bg-[#0F172A]/90 backdrop-blur-md rounded-xl border border-slate-700/80 shadow-xl pointer-events-auto">
         <div className="w-8 h-8 rounded-lg bg-cyan-500/20 border border-cyan-400/40 flex items-center justify-center text-cyan-400">
@@ -1129,15 +1000,39 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
           <h3 className="text-xs font-extrabold text-slate-100 tracking-wide uppercase font-mono-data flex items-center gap-1.5">
             DepthWizard 3D
             <Badge variant="outline" className="bg-cyan-500/20 text-cyan-300 border-cyan-500/40 text-[9px] px-1 py-0 font-mono-data">
-              Photogrammetry Engine
+              {scaleMode === "scientific" ? "Scientific 1.0x" : "Exploration Mode"}
             </Badge>
           </h3>
-          <p className="text-[10px] text-slate-400 font-mono-data">Explorable 2D-to-3D Aerial World</p>
+          <p className="text-[10px] text-slate-400 font-mono-data">Canonical WebGL 3D Reconstruction</p>
+        </div>
+
+        {/* Scale Mode Switcher */}
+        <div className="flex items-center gap-1 bg-slate-900/90 p-1 rounded-lg border border-slate-800 ml-2">
+          <Button
+            size="xs"
+            variant={scaleMode === "scientific" ? "default" : "ghost"}
+            onClick={() => setScaleMode("scientific")}
+            title="Strict 1.0x Metric Scale (Zero Distortion)"
+            className={`h-6 text-[10px] font-mono-data px-2 ${scaleMode === "scientific" ? "bg-emerald-500 text-black font-bold" : "text-slate-400 hover:text-white"}`}
+          >
+            <ShieldCheck className="w-3 h-3 mr-1" />
+            Scientific (1.0x)
+          </Button>
+          <Button
+            size="xs"
+            variant={scaleMode === "exploration" ? "default" : "ghost"}
+            onClick={() => setScaleMode("exploration")}
+            title="Enable Visual Elevation Exaggeration Slider"
+            className={`h-6 text-[10px] font-mono-data px-2 ${scaleMode === "exploration" ? "bg-cyan-500 text-black font-bold" : "text-slate-400 hover:text-white"}`}
+          >
+            <Sliders className="w-3 h-3 mr-1" />
+            Exploration
+          </Button>
         </div>
       </div>
 
       {/* ------------------------------------------------------------- */}
-      {/* TOP-RIGHT OVERLAY: Mode Switcher & Camera View Presets */}
+      {/* TOP-RIGHT OVERLAY: Instant Mode Switcher & Presets */}
       {/* ------------------------------------------------------------- */}
       <div className="absolute top-3 right-3 z-20 flex items-center gap-2 pointer-events-none">
         <div className="flex items-center gap-1 p-1 bg-[#0F172A]/90 backdrop-blur-md rounded-xl border border-slate-700 pointer-events-auto shadow-xl">
@@ -1169,15 +1064,15 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
 
           <Button
             size="sm"
-            variant={renderMode === "voxel" ? "default" : "ghost"}
-            onClick={() => setRenderMode("voxel")}
-            data-testid="viewer-mode-voxel-button"
+            variant={renderMode === "wireframe" ? "default" : "ghost"}
+            onClick={() => setRenderMode("wireframe")}
+            data-testid="viewer-mode-wireframe-button"
             className={`h-7 px-2.5 text-xs font-mono-data ${
-              renderMode === "voxel" ? "bg-cyan-500 text-black font-bold" : "text-slate-300 hover:text-white"
+              renderMode === "wireframe" ? "bg-cyan-500 text-black font-semibold" : "text-slate-300 hover:text-white"
             }`}
           >
-            <Boxes className="w-3.5 h-3.5 mr-1" />
-            Voxel World
+            <Grid3X3 className="w-3.5 h-3.5 mr-1" />
+            Wireframe
           </Button>
 
           <Button
@@ -1195,15 +1090,15 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
 
           <Button
             size="sm"
-            variant={renderMode === "wireframe" ? "default" : "ghost"}
-            onClick={() => setRenderMode("wireframe")}
-            data-testid="viewer-mode-wireframe-button"
+            variant={renderMode === "voxel" ? "default" : "ghost"}
+            onClick={() => setRenderMode("voxel")}
+            data-testid="viewer-mode-voxel-button"
             className={`h-7 px-2.5 text-xs font-mono-data ${
-              renderMode === "wireframe" ? "bg-cyan-500 text-black font-semibold" : "text-slate-300 hover:text-white"
+              renderMode === "voxel" ? "bg-cyan-500 text-black font-bold" : "text-slate-300 hover:text-white"
             }`}
           >
-            <Grid3X3 className="w-3.5 h-3.5 mr-1" />
-            Wireframe
+            <Boxes className="w-3.5 h-3.5 mr-1" />
+            Voxel World
           </Button>
 
           <Button
@@ -1227,7 +1122,6 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
             variant="ghost"
             onClick={setIsometricView}
             title="Isometric 3D View"
-            data-testid="viewer-isometric-button"
             className="text-slate-300 hover:text-cyan-400 h-7 w-7"
           >
             <Compass className="w-3.5 h-3.5" />
@@ -1238,7 +1132,6 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
             variant="ghost"
             onClick={setTopView}
             title="Top-Down Ortho View"
-            data-testid="viewer-topview-button"
             className="text-slate-300 hover:text-cyan-400 h-7 w-7"
           >
             <Eye className="w-3.5 h-3.5" />
@@ -1249,7 +1142,6 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
             variant="ghost"
             onClick={setStreetView}
             title="Street-Level View"
-            data-testid="viewer-streetview-button"
             className="text-slate-300 hover:text-cyan-400 h-7 w-7"
           >
             <Camera className="w-3.5 h-3.5" />
@@ -1258,39 +1150,19 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
       </div>
 
       {/* ------------------------------------------------------------- */}
-      {/* RIGHT SIDEBAR: Height Legend & Interactive Controls Panel */}
+      {/* RIGHT SIDEBAR: Controls & Performance Options */}
       {/* ------------------------------------------------------------- */}
-      <div className="absolute top-16 right-3 z-20 flex flex-col gap-2.5 pointer-events-none w-44">
+      <div className="absolute top-16 right-3 z-20 flex flex-col gap-2.5 pointer-events-none w-48">
         
-        {/* Height Legend Panel */}
-        <div className="p-3 bg-[#0F172A]/90 backdrop-blur-md rounded-xl border border-slate-700/80 shadow-xl pointer-events-auto text-xs font-mono-data space-y-2">
-          <div className="flex items-center justify-between text-slate-200 font-bold border-b border-slate-800 pb-1.5">
-            <span>Elevation (m)</span>
-            <span className="text-[10px] text-cyan-400">{selectedBuilding?.calibrated_height_m ? 'Metric' : 'Relative'}</span>
-          </div>
-
-          <div className="flex items-center gap-2.5">
-            <div className="w-3.5 h-28 rounded-md bg-gradient-to-t from-red-600 via-yellow-400 via-emerald-400 via-sky-400 to-slate-700 border border-slate-700 shrink-0" />
-
-            <div className="flex flex-col justify-between h-28 text-[10px] text-slate-300 font-mono-data">
-              <span className="font-semibold text-red-400">{maxSceneHeightMeters}+ m</span>
-              <span className="text-yellow-300">{Math.round(maxSceneHeightMeters * 0.8)} m</span>
-              <span className="text-emerald-300">{Math.round(maxSceneHeightMeters * 0.6)} m</span>
-              <span className="text-sky-300">{Math.round(maxSceneHeightMeters * 0.2)} m</span>
-              <span className="text-slate-400">0 m</span>
-            </div>
-          </div>
-        </div>
-
         {/* Controls Panel */}
         <div className="p-3 bg-[#0F172A]/90 backdrop-blur-md rounded-xl border border-slate-700/80 shadow-xl pointer-events-auto text-xs font-mono-data space-y-2">
           <div className="flex items-center justify-between text-slate-200 font-bold border-b border-slate-800 pb-1.5">
-            <span>Spatial Physics</span>
+            <span>Spatial Controls</span>
             <Button
               size="icon-xs"
               variant="ghost"
               onClick={resetCamera}
-              title="Reset View [R]"
+              title="Fit Scene [R]"
               className="text-cyan-400 hover:bg-cyan-500/20 h-5 w-5"
             >
               <RotateCcw className="w-3 h-3" />
@@ -1314,18 +1186,49 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
               <span className="font-bold text-indigo-400">Dbl Click</span>
               <span>Focus Object</span>
             </div>
-            <div className="pt-1">
+            <div className="pt-1 flex gap-1">
               <Button
                 size="sm"
                 variant="outline"
                 onClick={resetCamera}
                 className="w-full h-6 text-[10px] bg-slate-800/80 border-slate-700 text-cyan-300 hover:bg-cyan-500/20"
               >
-                [R] Reset View
+                [R] Fit View
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setShowDebugHud(!showDebugHud)}
+                title="Toggle Performance Telemetry"
+                className={`h-6 text-[10px] px-1.5 ${showDebugHud ? "bg-cyan-500/20 text-cyan-300" : "text-slate-400"}`}
+              >
+                <Activity className="w-3 h-3" />
               </Button>
             </div>
           </div>
         </div>
+
+        {/* Debug HUD Overlay */}
+        {showDebugHud && (
+          <div className="p-2.5 bg-[#0F172A]/95 backdrop-blur-md rounded-xl border border-cyan-500/40 shadow-2xl pointer-events-auto text-[10px] font-mono-data space-y-1 text-slate-300 animate-in fade-in">
+            <div className="flex justify-between font-bold border-b border-slate-800 pb-1 text-cyan-300">
+              <span>Performance Telemetry</span>
+              <span className={debugStats.fps >= 50 ? "text-emerald-400" : "text-amber-400"}>{debugStats.fps} FPS</span>
+            </div>
+            <div className="flex justify-between">
+              <span>Draw Calls:</span>
+              <span className="text-slate-100 font-bold">{debugStats.drawCalls}</span>
+            </div>
+            <div className="flex justify-between">
+              <span>Triangles:</span>
+              <span className="text-slate-100">{debugStats.triangles.toLocaleString()}</span>
+            </div>
+            <div className="flex justify-between">
+              <span>Points:</span>
+              <span className="text-slate-100">{debugStats.points.toLocaleString()}</span>
+            </div>
+          </div>
+        )}
 
       </div>
 
@@ -1357,12 +1260,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
               <Building2 className="w-4 h-4" />
               <span className="truncate">{selectedBuilding.name}</span>
             </div>
-            <button
-              onClick={() => onSelectBuilding?.(null)}
-              className="text-slate-400 hover:text-white text-xs px-1"
-            >
-              ✕
-            </button>
+            <button onClick={() => onSelectBuilding?.(null)} className="text-slate-400 hover:text-white text-xs px-1">✕</button>
           </div>
 
           <div className="grid grid-cols-2 gap-2 text-[11px]">
@@ -1397,7 +1295,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
       )}
 
       {/* ------------------------------------------------------------- */}
-      {/* BOTTOM-LEFT OVERLAY: Input Aerial Image Thumbnail Overlay */}
+      {/* BOTTOM-LEFT OVERLAY: Input Aerial Image Thumbnail */}
       {/* ------------------------------------------------------------- */}
       {imageUrl && (
         <div className="absolute bottom-3 left-3 z-20 pointer-events-auto">
@@ -1405,10 +1303,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
             <div className="p-2 bg-[#0F172A]/95 backdrop-blur-md rounded-xl border border-slate-700/90 shadow-2xl space-y-1.5 w-48">
               <div className="flex items-center justify-between text-[11px] font-bold text-slate-200 font-mono-data">
                 <span>Input Aerial Image</span>
-                <button
-                  onClick={() => setShowAerialThumbnail(false)}
-                  className="text-slate-400 hover:text-white p-0.5"
-                >
+                <button onClick={() => setShowAerialThumbnail(false)} className="text-slate-400 hover:text-white p-0.5">
                   <Minimize2 className="w-3 h-3" />
                 </button>
               </div>
@@ -1445,87 +1340,30 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
       {/* BOTTOM-RIGHT OVERLAY: Telemetry & Controls */}
       {/* ------------------------------------------------------------- */}
       <div className="absolute bottom-3 right-3 z-20 max-w-xs p-3 bg-[#0F172A]/90 backdrop-blur-md rounded-xl border border-slate-700/80 shadow-xl pointer-events-auto text-xs text-slate-300 font-mono-data space-y-1">
-        <h4 className="font-bold text-slate-100 flex items-center gap-1.5">
-          <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
-          Interactive 3D Reconstruction
-        </h4>
-        <p className="text-[11px] text-slate-400 leading-tight">
-          PBR shader textures projected onto edge-sharpened neural depth.
-        </p>
-        <div className="pt-1 flex items-center justify-between">
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => setIsFlythroughActive(!isFlythroughActive)}
-            className={`h-6 text-[10px] px-2 font-mono-data ${
-              isFlythroughActive ? "bg-cyan-500/20 text-cyan-300 animate-pulse" : "text-cyan-400 hover:bg-cyan-500/20"
-            }`}
-          >
-            {isFlythroughActive ? <Pause className="w-3 h-3 mr-1" /> : <Play className="w-3 h-3 mr-1" />}
-            {isFlythroughActive ? `Flythrough ${flythroughProgress}%` : "Cinematic Flythrough"}
-          </Button>
+        <div className="flex items-center justify-between">
+          <h4 className="font-bold text-slate-100 flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
+            3D Spatial Engine
+          </h4>
+          <span className="text-[10px] text-cyan-400 font-bold uppercase">{scaleMode}</span>
+        </div>
 
-          <div className="flex items-center gap-1 text-[10px] text-slate-400 font-mono-data">
-            <span>Scale:</span>
+        {scaleMode === "exploration" && (
+          <div className="pt-1 flex items-center justify-between gap-2 border-t border-slate-800">
+            <span className="text-[10px] text-slate-400">Exaggeration:</span>
             <input
               type="range"
-              min="0.4"
+              min="0.5"
               max="3.0"
               step="0.1"
               value={verticalExaggeration}
               onChange={(e) => setVerticalExaggeration(parseFloat(e.target.value))}
-              className="w-14 h-1 bg-slate-700 rounded appearance-none cursor-pointer accent-cyan-400"
+              className="w-20 h-1 bg-slate-700 rounded appearance-none cursor-pointer accent-cyan-400"
             />
-            <span className="text-cyan-300">{verticalExaggeration.toFixed(1)}x</span>
+            <span className="text-cyan-300 text-[10px] font-bold">{verticalExaggeration.toFixed(1)}x</span>
           </div>
-        </div>
+        )}
       </div>
-
-      {/* ------------------------------------------------------------- */}
-      {/* RECONSTRUCTION LOADING OVERLAY */}
-      {/* ------------------------------------------------------------- */}
-      {loadingStep < 7 && (
-        <div className="absolute inset-0 z-40 bg-[#070A0F]/95 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center font-mono-data space-y-4">
-          <div className="relative flex items-center justify-center w-16 h-16 rounded-2xl bg-cyan-500/10 border border-cyan-400/40 text-cyan-400 shadow-2xl">
-            <Loader2 className="w-8 h-8 animate-spin" />
-            <Sparkles className="w-4 h-4 absolute top-2 right-2 text-cyan-300 animate-pulse" />
-          </div>
-
-          <div>
-            <h3 className="text-base font-extrabold text-white tracking-wide">
-              RECONSTRUCTING 3D WORLD
-            </h3>
-            <p className="text-xs text-slate-400 mt-1">Generating photorealistic interactive WebGL environment</p>
-          </div>
-
-          <div className="w-72 space-y-2 text-left text-xs bg-slate-900/90 p-4 rounded-xl border border-slate-800">
-            <div className={`flex items-center gap-2 ${loadingStep >= 1 ? "text-cyan-300" : "text-slate-600"}`}>
-              {loadingStep > 1 ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> : <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-              <span>Loading aerial image</span>
-            </div>
-            <div className={`flex items-center gap-2 ${loadingStep >= 2 ? "text-cyan-300" : "text-slate-600"}`}>
-              {loadingStep > 2 ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> : loadingStep === 2 ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
-              <span>Computing neural depth map</span>
-            </div>
-            <div className={`flex items-center gap-2 ${loadingStep >= 3 ? "text-cyan-300" : "text-slate-600"}`}>
-              {loadingStep > 3 ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> : loadingStep === 3 ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
-              <span>Detecting structure footprints</span>
-            </div>
-            <div className={`flex items-center gap-2 ${loadingStep >= 4 ? "text-cyan-300" : "text-slate-600"}`}>
-              {loadingStep > 4 ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> : loadingStep === 4 ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
-              <span>Generating 3D wall skirts & terrain</span>
-            </div>
-            <div className={`flex items-center gap-2 ${loadingStep >= 5 ? "text-cyan-300" : "text-slate-600"}`}>
-              {loadingStep > 5 ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> : loadingStep === 5 ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
-              <span>Applying PBR UV aerial textures</span>
-            </div>
-            <div className={`flex items-center gap-2 ${loadingStep >= 6 ? "text-cyan-300" : "text-slate-600"}`}>
-              {loadingStep > 6 ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> : loadingStep === 6 ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
-              <span>Finalizing lighting & shadows</span>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* WEBGL CANVAS */}
       <div
