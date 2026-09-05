@@ -15,42 +15,57 @@ import {
   Boxes,
   Maximize2,
   Minimize2,
-  MousePointer,
-  Move,
-  ZoomIn,
   Image as ImageIcon,
-  Sparkles
+  Sparkles,
+  Building2,
+  CheckCircle2,
+  Loader2,
+  Camera,
+  Layers
 } from "lucide-react";
 
 interface ThreeViewerProps {
   pointcloud?: PointCloudData | null;
   mesh?: MeshHeightfieldData | null;
   imageUrl?: string;
+  depthColormapUrl?: string;
   selectedBuilding?: BuildingMeasurement | null;
+  sampleBuildings?: BuildingMeasurement[];
+  onSelectBuilding?: (building: BuildingMeasurement | null) => void;
   hoverCoordinate?: { u: number; v: number; relDepth: number } | null;
   heightScale?: number;
-  /** [height, width] of the depth grid: the coordinate space bboxes are measured in. */
   depthShape?: [number, number];
+  isLoading?: boolean;
 }
 
-export type RenderMode = "mesh" | "voxel" | "pointcloud" | "wireframe" | "heatmap";
+export type RenderMode = "mesh" | "depth" | "heatmap" | "wireframe" | "pointcloud" | "voxel";
 
 export const ThreeViewer: React.FC<ThreeViewerProps> = ({
   pointcloud,
   mesh,
   imageUrl,
+  depthColormapUrl,
   selectedBuilding,
+  sampleBuildings = [],
+  onSelectBuilding,
   hoverCoordinate,
   depthShape,
+  isLoading = false,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [renderMode, setRenderMode] = useState<RenderMode>("mesh");
   const [isFlythroughActive, setIsFlythroughActive] = useState<boolean>(false);
   const [flythroughProgress, setFlythroughProgress] = useState<number>(0);
-  const [verticalExaggeration, setVerticalExaggeration] = useState<number>(1.3);
-  const [pointSize] = useState<number>(1.6);
+  const [verticalExaggeration, setVerticalExaggeration] = useState<number>(1.4);
   const [showAerialThumbnail, setShowAerialThumbnail] = useState<boolean>(true);
   const [maxSceneHeightMeters, setMaxSceneHeightMeters] = useState<number>(50);
+
+  // Hover & Raycast State
+  const [hoveredBuilding, setHoveredBuilding] = useState<BuildingMeasurement | null>(null);
+  const [hoverTooltip, setHoverTooltip] = useState<{ x: number; y: number; info: string; height?: string } | null>(null);
+
+  // Reconstruction Loading Progress Sequence State
+  const [loadingStep, setLoadingStep] = useState<number>(0);
 
   // Three.js instances refs
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -58,13 +73,21 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const pointsObjectRef = useRef<THREE.Points | null>(null);
   const meshObjectRef = useRef<THREE.Mesh | null>(null);
+  const depthMeshObjectRef = useRef<THREE.Mesh | null>(null);
   const wireframeObjectRef = useRef<THREE.Mesh | null>(null);
   const heatmapObjectRef = useRef<THREE.Mesh | null>(null);
   const voxelGroupRef = useRef<THREE.Group | null>(null);
+  const buildingsGroupRef = useRef<THREE.Group | null>(null);
+  const treesGroupRef = useRef<THREE.Group | null>(null);
   const cursorMarkerRef = useRef<THREE.Group | null>(null);
   const buildingBoxRef = useRef<THREE.LineSegments | null>(null);
   const flythroughCurveRef = useRef<THREE.CatmullRomCurve3 | null>(null);
-  const loadedTextureRef = useRef<THREE.Texture | null>(null);
+
+  // Textures
+  const loadedRgbTextureRef = useRef<THREE.Texture | null>(null);
+  const loadedDepthTextureRef = useRef<THREE.Texture | null>(null);
+
+  // Animation & Camera Movement
   const flythroughT = useRef<number>(0);
   const animFrameId = useRef<number | null>(null);
 
@@ -72,12 +95,44 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
   const isMouseDown = useRef<boolean>(false);
   const mouseButton = useRef<number>(0); // 0: left (rotate), 2: right (pan)
   const mousePrev = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+
+  // Camera Orbit & Target Lerp
   const cameraTarget = useRef<THREE.Vector3>(new THREE.Vector3(0, 0, 0));
+  const desiredCameraTarget = useRef<THREE.Vector3>(new THREE.Vector3(0, 0, 0));
   const cameraAngle = useRef<{ theta: number; phi: number; radius: number }>({
     theta: Math.PI / 4,
-    phi: Math.PI / 3.5,
+    phi: Math.PI / 3.4,
     radius: 140,
   });
+  const desiredCameraAngle = useRef<{ theta: number; phi: number; radius: number }>({
+    theta: Math.PI / 4,
+    phi: Math.PI / 3.4,
+    radius: 140,
+  });
+
+  // Keyboard Navigation state
+  const keysPressed = useRef<{ [key: string]: boolean }>({});
+
+  // Loading animation simulation sequence
+  useEffect(() => {
+    if (isLoading) {
+      setLoadingStep(1);
+      const timer1 = setTimeout(() => setLoadingStep(2), 600);
+      const timer2 = setTimeout(() => setLoadingStep(3), 1200);
+      const timer3 = setTimeout(() => setLoadingStep(4), 1800);
+      const timer4 = setTimeout(() => setLoadingStep(5), 2400);
+      const timer5 = setTimeout(() => setLoadingStep(6), 3000);
+      return () => {
+        clearTimeout(timer1);
+        clearTimeout(timer2);
+        clearTimeout(timer3);
+        clearTimeout(timer4);
+        clearTimeout(timer5);
+      };
+    } else {
+      setLoadingStep(7);
+    }
+  }, [isLoading]);
 
   // Update max scene height in meters when selected building or scene changes
   useEffect(() => {
@@ -88,9 +143,17 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     }
   }, [selectedBuilding]);
 
-  // Update Camera Position & Target
+  // Smooth Camera Position Update with Damping / Inertia
   const updateCameraPosition = useCallback(() => {
     if (!cameraRef.current || isFlythroughActive) return;
+
+    // Smoothly lerp camera angle & target towards desired values
+    const dt = 0.15; // lerp factor
+    cameraAngle.current.theta += (desiredCameraAngle.current.theta - cameraAngle.current.theta) * dt;
+    cameraAngle.current.phi += (desiredCameraAngle.current.phi - cameraAngle.current.phi) * dt;
+    cameraAngle.current.radius += (desiredCameraAngle.current.radius - cameraAngle.current.radius) * dt;
+    cameraTarget.current.lerp(desiredCameraTarget.current, dt);
+
     const { theta, phi, radius } = cameraAngle.current;
     const target = cameraTarget.current;
 
@@ -102,7 +165,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     cameraRef.current.lookAt(target);
   }, [isFlythroughActive]);
 
-  // Pre-load HD Aerial Texture from imageUrl
+  // Pre-load HD RGB Aerial Texture
   useEffect(() => {
     if (!imageUrl) return;
     const loader = new THREE.TextureLoader();
@@ -117,9 +180,9 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
         tex.magFilter = THREE.LinearFilter;
         tex.wrapS = THREE.ClampToEdgeWrapping;
         tex.wrapT = THREE.ClampToEdgeWrapping;
-        loadedTextureRef.current = tex;
+        tex.anisotropy = 16;
+        loadedRgbTextureRef.current = tex;
 
-        // Apply texture to 3D mesh if already constructed
         if (meshObjectRef.current) {
           const mat = meshObjectRef.current.material as THREE.MeshStandardMaterial;
           mat.map = tex;
@@ -128,27 +191,54 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
         }
       },
       undefined,
-      (err) => console.warn("Aerial texture load warning:", err)
+      (err) => console.warn("RGB texture load warning:", err)
     );
   }, [imageUrl]);
 
-  // Initialize Three.js Scene
+  // Pre-load Depth Colormap Texture
+  useEffect(() => {
+    if (!depthColormapUrl) return;
+    const loader = new THREE.TextureLoader();
+    loader.crossOrigin = "anonymous";
+
+    loader.load(
+      depthColormapUrl,
+      (tex) => {
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.generateMipmaps = true;
+        tex.minFilter = THREE.LinearMipmapLinearFilter;
+        tex.magFilter = THREE.LinearFilter;
+        loadedDepthTextureRef.current = tex;
+
+        if (depthMeshObjectRef.current) {
+          const mat = depthMeshObjectRef.current.material as THREE.MeshStandardMaterial;
+          mat.map = tex;
+          mat.vertexColors = false;
+          mat.needsUpdate = true;
+        }
+      },
+      undefined,
+      (err) => console.warn("Depth texture load warning:", err)
+    );
+  }, [depthColormapUrl]);
+
+  // Initialize Three.js Scene & Render Engine
   useEffect(() => {
     if (!containerRef.current) return;
     const container = containerRef.current;
     const width = container.clientWidth || 700;
-    const height = container.clientHeight || 540;
+    const height = container.clientHeight || 550;
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x070a0f);
-    scene.fog = new THREE.FogExp2(0x070a0f, 0.0022);
+    scene.fog = new THREE.FogExp2(0x070a0f, 0.0018);
     sceneRef.current = scene;
 
     // Perspective Camera
-    const camera = new THREE.PerspectiveCamera(40, width / height, 0.5, 1200);
+    const camera = new THREE.PerspectiveCamera(42, width / height, 0.5, 1500);
     cameraRef.current = camera;
 
-    // WebGL Renderer with High Precision & ACES Filmic Tone Mapping
+    // WebGL Renderer with High Precision, Shadows, ACES Filmic Tone Mapping
     const renderer = new THREE.WebGLRenderer({ 
       antialias: true, 
       alpha: true, 
@@ -160,34 +250,34 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.15;
+    renderer.toneMappingExposure = 1.2;
 
     container.innerHTML = "";
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
-    // Realistic Lighting System (Sunlight + Ambient Occlusion Fill)
-    const ambientLight = new THREE.AmbientLight(0xffffff, 0.85);
+    // Realistic Lighting System (Sunlight + Ambient Occlusion + Sky Fill)
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.9);
     scene.add(ambientLight);
 
-    const sunLight = new THREE.DirectionalLight(0xfff7ed, 1.5);
-    sunLight.position.set(85, 135, 75);
+    const sunLight = new THREE.DirectionalLight(0xfff7ed, 1.6);
+    sunLight.position.set(90, 150, 80);
     sunLight.castShadow = true;
     sunLight.shadow.mapSize.width = 2048;
     sunLight.shadow.mapSize.height = 2048;
-    sunLight.shadow.bias = -0.0004;
+    sunLight.shadow.bias = -0.0003;
     scene.add(sunLight);
 
-    const skyFill = new THREE.DirectionalLight(0x38bdf8, 0.4);
-    skyFill.position.set(-80, 60, -80);
+    const skyFill = new THREE.DirectionalLight(0x38bdf8, 0.45);
+    skyFill.position.set(-90, 70, -90);
     scene.add(skyFill);
 
-    const groundBounce = new THREE.DirectionalLight(0xa3e635, 0.2);
-    groundBounce.position.set(0, -40, 0);
+    const groundBounce = new THREE.DirectionalLight(0xa3e635, 0.25);
+    groundBounce.position.set(0, -50, 0);
     scene.add(groundBounce);
 
-    // Floor Base Slab
-    const trayGeo = new THREE.BoxGeometry(108, 4, 108);
+    // Floor Base Tray & Grid
+    const trayGeo = new THREE.BoxGeometry(112, 4, 112);
     const trayMat = new THREE.MeshStandardMaterial({
       color: 0x1e293b,
       roughness: 0.85,
@@ -198,12 +288,11 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     trayMesh.receiveShadow = true;
     scene.add(trayMesh);
 
-    // Subtle Grid Overlay
-    const gridHelper = new THREE.GridHelper(108, 36, 0x00e5ff, 0x334155);
+    const gridHelper = new THREE.GridHelper(112, 36, 0x00e5ff, 0x334155);
     gridHelper.position.y = -0.05;
     scene.add(gridHelper);
 
-    // Synchronized Cursor Pin
+    // Hover Marker Pin
     const markerGroup = new THREE.Group();
     const pinGeo = new THREE.CylinderGeometry(0.2, 0.8, 12, 12);
     const pinMat = new THREE.MeshBasicMaterial({ color: 0x00e5ff });
@@ -222,7 +311,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     scene.add(markerGroup);
     cursorMarkerRef.current = markerGroup;
 
-    // Flythrough Path
+    // Flythrough Path Spline
     const splinePoints = [
       new THREE.Vector3(110, 90, 110),
       new THREE.Vector3(40, 45, 90),
@@ -234,13 +323,68 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     ];
     flythroughCurveRef.current = new THREE.CatmullRomCurve3(splinePoints, true);
 
-    // Camera initial angle
-    cameraAngle.current = { theta: Math.PI / 3.8, phi: Math.PI / 3.4, radius: 145 };
+    // Initial Camera Setup
+    desiredCameraAngle.current = { theta: Math.PI / 3.8, phi: Math.PI / 3.4, radius: 145 };
+    cameraAngle.current = { ...desiredCameraAngle.current };
     updateCameraPosition();
 
-    // Render Loop
+    // Keyboard WASD Movement Loop
+    const handleKeyDown = (e: KeyboardEvent) => {
+      keysPressed.current[e.key.toLowerCase()] = true;
+
+      if (e.key.toLowerCase() === "r") {
+        resetCamera();
+      } else if (e.key === "Escape") {
+        onSelectBuilding?.(null);
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      keysPressed.current[e.key.toLowerCase()] = false;
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+
+    // Main Render Animation Loop
     const animate = () => {
       animFrameId.current = requestAnimationFrame(animate);
+
+      // Process WASD Keyboard movement
+      const moveSpeed = keysPressed.current["shift"] ? 1.8 : 0.8;
+      const { theta } = cameraAngle.current;
+      const right = new THREE.Vector3(1, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), theta);
+      const forward = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(0, 1, 0), theta);
+
+      let moved = false;
+      if (keysPressed.current["w"]) {
+        desiredCameraTarget.current.addScaledVector(forward, moveSpeed);
+        moved = true;
+      }
+      if (keysPressed.current["s"]) {
+        desiredCameraTarget.current.addScaledVector(forward, -moveSpeed);
+        moved = true;
+      }
+      if (keysPressed.current["a"]) {
+        desiredCameraTarget.current.addScaledVector(right, -moveSpeed);
+        moved = true;
+      }
+      if (keysPressed.current["d"]) {
+        desiredCameraTarget.current.addScaledVector(right, moveSpeed);
+        moved = true;
+      }
+      if (keysPressed.current[" "]) {
+        desiredCameraTarget.current.y += moveSpeed;
+        moved = true;
+      }
+      if (keysPressed.current["control"]) {
+        desiredCameraTarget.current.y = Math.max(-5, desiredCameraTarget.current.y - moveSpeed);
+        moved = true;
+      }
+
+      if (moved || isFlythroughActive || true) {
+        updateCameraPosition();
+      }
 
       if (isFlythroughActive && flythroughCurveRef.current && cameraRef.current) {
         flythroughT.current = (flythroughT.current + 0.0015) % 1.0;
@@ -269,12 +413,14 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
 
     return () => {
       window.removeEventListener("resize", handleResize);
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
       if (animFrameId.current) cancelAnimationFrame(animFrameId.current);
       renderer.dispose();
     };
-  }, [updateCameraPosition]);
+  }, [updateCameraPosition, isFlythroughActive]);
 
-  // Mouse Controls
+  // Mouse Orbit, Pan, Zoom, Double-click Focus & Raycasting Interaction
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -286,26 +432,100 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     };
 
     const onMouseMove = (e: MouseEvent) => {
-      if (!isMouseDown.current || isFlythroughActive) return;
-      const dx = e.clientX - mousePrev.current.x;
-      const dy = e.clientY - mousePrev.current.y;
-      mousePrev.current = { x: e.clientX, y: e.clientY };
+      if (!container || !cameraRef.current) return;
 
-      if (mouseButton.current === 0 && !e.shiftKey) {
-        cameraAngle.current.theta -= dx * 0.0075;
-        cameraAngle.current.phi = Math.max(0.08, Math.min(Math.PI / 2 - 0.02, cameraAngle.current.phi + dy * 0.0075));
+      // Handle Mouse Drag Camera Controls
+      if (isMouseDown.current && !isFlythroughActive) {
+        const dx = e.clientX - mousePrev.current.x;
+        const dy = e.clientY - mousePrev.current.y;
+        mousePrev.current = { x: e.clientX, y: e.clientY };
+
+        if (mouseButton.current === 0 && !e.shiftKey) {
+          // Orbit
+          desiredCameraAngle.current.theta -= dx * 0.0075;
+          desiredCameraAngle.current.phi = Math.max(
+            0.08, 
+            Math.min(Math.PI / 2 - 0.02, desiredCameraAngle.current.phi + dy * 0.0075)
+          );
+        } else {
+          // Pan
+          const right = new THREE.Vector3(1, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), cameraAngle.current.theta);
+          const forward = new THREE.Vector3(0, 0, 1).applyAxisAngle(new THREE.Vector3(0, 1, 0), cameraAngle.current.theta);
+          const panSpeed = cameraAngle.current.radius * 0.0012;
+
+          desiredCameraTarget.current.addScaledVector(right, -dx * panSpeed);
+          desiredCameraTarget.current.addScaledVector(forward, -dy * panSpeed);
+        }
+        updateCameraPosition();
       } else {
-        const right = new THREE.Vector3(1, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), cameraAngle.current.theta);
-        const forward = new THREE.Vector3(0, 0, 1).applyAxisAngle(new THREE.Vector3(0, 1, 0), cameraAngle.current.theta);
-        const panSpeed = cameraAngle.current.radius * 0.0012;
-        cameraTarget.current.addScaledVector(right, -dx * panSpeed);
-        cameraTarget.current.addScaledVector(forward, -dy * panSpeed);
+        // Handle Hover Raycast & Tooltip
+        const rect = container.getBoundingClientRect();
+        const mouseX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        const mouseY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+        const raycaster = new THREE.Raycaster();
+        raycaster.setFromCamera(new THREE.Vector2(mouseX, mouseY), cameraRef.current);
+
+        if (buildingsGroupRef.current) {
+          const intersects = raycaster.intersectObjects(buildingsGroupRef.current.children, true);
+          if (intersects.length > 0) {
+            const hitObj = intersects[0].object;
+            const bId = hitObj.userData?.buildingId;
+            if (bId) {
+              const matchedBldg = sampleBuildings.find((b) => b.id === bId);
+              if (matchedBldg) {
+                setHoveredBuilding(matchedBldg);
+                setHoverTooltip({
+                  x: e.clientX - rect.left,
+                  y: e.clientY - rect.top,
+                  info: `${matchedBldg.name}`,
+                  height: matchedBldg.calibrated_height_m 
+                    ? `${matchedBldg.calibrated_height_m}m` 
+                    : `Peak: ${matchedBldg.rooftop_peak_z_rel.toFixed(2)} rel`
+                });
+                return;
+              }
+            }
+          }
+        }
+        setHoveredBuilding(null);
+        setHoverTooltip(null);
       }
-      updateCameraPosition();
     };
 
-    const onMouseUp = () => {
+    const onMouseUp = (e: MouseEvent) => {
       isMouseDown.current = false;
+
+      // Handle Click Object Selection
+      if (hoveredBuilding && e.button === 0) {
+        onSelectBuilding?.(hoveredBuilding);
+        focusBuilding(hoveredBuilding);
+      }
+    };
+
+    const onDoubleClick = (e: MouseEvent) => {
+      e.preventDefault();
+      if (hoveredBuilding) {
+        onSelectBuilding?.(hoveredBuilding);
+        focusBuilding(hoveredBuilding);
+      } else if (container && cameraRef.current) {
+        const rect = container.getBoundingClientRect();
+        const mouseX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        const mouseY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+        const raycaster = new THREE.Raycaster();
+        raycaster.setFromCamera(new THREE.Vector2(mouseX, mouseY), cameraRef.current);
+
+        if (meshObjectRef.current) {
+          const intersects = raycaster.intersectObject(meshObjectRef.current);
+          if (intersects.length > 0) {
+            const point = intersects[0].point;
+            desiredCameraTarget.current.copy(point);
+            desiredCameraAngle.current.radius = Math.max(35, cameraAngle.current.radius * 0.6);
+            updateCameraPosition();
+          }
+        }
+      }
     };
 
     const onContextMenu = (e: MouseEvent) => e.preventDefault();
@@ -313,7 +533,10 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
       if (isFlythroughActive) return;
-      cameraAngle.current.radius = Math.max(15, Math.min(320, cameraAngle.current.radius + e.deltaY * 0.14));
+      desiredCameraAngle.current.radius = Math.max(
+        15, 
+        Math.min(320, desiredCameraAngle.current.radius + e.deltaY * 0.14)
+      );
       updateCameraPosition();
     };
 
@@ -321,6 +544,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     container.addEventListener("contextmenu", onContextMenu);
     window.addEventListener("mousemove", onMouseMove);
     window.addEventListener("mouseup", onMouseUp);
+    container.addEventListener("dblclick", onDoubleClick);
     container.addEventListener("wheel", onWheel, { passive: false });
 
     return () => {
@@ -328,17 +552,39 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
       container.removeEventListener("contextmenu", onContextMenu);
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
+      container.removeEventListener("dblclick", onDoubleClick);
       container.removeEventListener("wheel", onWheel);
     };
-  }, [updateCameraPosition, isFlythroughActive]);
+  }, [updateCameraPosition, isFlythroughActive, hoveredBuilding, sampleBuildings, onSelectBuilding]);
 
-  // Edge-preserving Bilateral Filter to make building facades vertical and roofs sharp
+  // Focus camera smoothly on selected building
+  const focusBuilding = useCallback((bldg: BuildingMeasurement) => {
+    const [bx, by, bw, bh] = bldg.bbox;
+    const refH = depthShape?.[0] ?? 1024;
+    const refW = depthShape?.[1] ?? 1024;
+    const cx = (bx + bw / 2) / refW;
+    const cy = (by + bh / 2) / refH;
+
+    const x3d = (cx - 0.5) * 100;
+    const z3d = (cy - 0.5) * 100;
+    const roofZ = bldg.rooftop_peak_z_rel * 28 * verticalExaggeration;
+
+    desiredCameraTarget.current.set(x3d, roofZ * 0.5, z3d);
+    desiredCameraAngle.current = {
+      theta: Math.PI / 4,
+      phi: Math.PI / 3.5,
+      radius: 50,
+    };
+    updateCameraPosition();
+  }, [depthShape, verticalExaggeration, updateCameraPosition]);
+
+  // Edge-preserving Bilateral Filter to make building facades vertical & roofs sharp
   const getEdgePreservedHeights = useCallback((meshData: MeshHeightfieldData): Float32Array => {
     const gw = meshData.grid_width;
     const gh = meshData.grid_height;
     const raw = meshData.heights;
     const out = new Float32Array(raw.length);
-    const thresh = 0.07; // step boundary threshold
+    const thresh = 0.06;
 
     for (let r = 0; r < gh; r++) {
       for (let c = 0; c < gw; c++) {
@@ -365,7 +611,6 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
         }
 
         if (edgeCount >= 3) {
-          // Sharpen building edge to prevent diagonal slope melting
           out[idx] = val > (maxNeighbor + minNeighbor) / 2 ? maxNeighbor : minNeighbor;
         } else {
           out[idx] = val;
@@ -375,15 +620,16 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     return out;
   }, []);
 
-  // Build 3D Objects (Realistic Textured Mesh, Roblox/Minecraft Voxel World, Point Cloud, Wireframe, Heatmap)
+  // Build 3D World (Reconstructed Mesh + Extruded Building Wall Skirts + Instanced Trees + Voxels + Pointcloud)
   useEffect(() => {
     const scene = sceneRef.current;
     if (!scene) return;
 
-    // Disposal
-    if (voxelGroupRef.current) {
-      scene.remove(voxelGroupRef.current);
-      voxelGroupRef.current.traverse((child) => {
+    // Dispose Previous Objects
+    const disposeGroup = (grp: THREE.Group | null) => {
+      if (!grp) return;
+      scene.remove(grp);
+      grp.traverse((child) => {
         if ((child as THREE.Mesh).geometry) (child as THREE.Mesh).geometry.dispose();
         if ((child as THREE.Mesh).material) {
           const mat = (child as THREE.Mesh).material;
@@ -391,8 +637,17 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
           else mat.dispose();
         }
       });
-      voxelGroupRef.current = null;
-    }
+    };
+
+    disposeGroup(voxelGroupRef.current);
+    voxelGroupRef.current = null;
+
+    disposeGroup(buildingsGroupRef.current);
+    buildingsGroupRef.current = null;
+
+    disposeGroup(treesGroupRef.current);
+    treesGroupRef.current = null;
+
     if (pointsObjectRef.current) {
       scene.remove(pointsObjectRef.current);
       pointsObjectRef.current.geometry.dispose();
@@ -404,6 +659,12 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
       meshObjectRef.current.geometry.dispose();
       (meshObjectRef.current.material as THREE.Material).dispose();
       meshObjectRef.current = null;
+    }
+    if (depthMeshObjectRef.current) {
+      scene.remove(depthMeshObjectRef.current);
+      depthMeshObjectRef.current.geometry.dispose();
+      (depthMeshObjectRef.current.material as THREE.Material).dispose();
+      depthMeshObjectRef.current = null;
     }
     if (wireframeObjectRef.current) {
       scene.remove(wireframeObjectRef.current);
@@ -426,7 +687,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     const heightsFiltered = getEdgePreservedHeights(mesh);
 
     // -------------------------------------------------------------
-    // 1. REALISTIC SMOOTH TEXTURED 3D MESH (UV IMAGE MAPPED)
+    // 1. REALISTIC SMOOTH TEXTURED TERRAIN MESH
     // -------------------------------------------------------------
     const planeGeo = new THREE.PlaneGeometry(planeSize, (planeSize * gh) / gw, gw - 1, gh - 1);
     planeGeo.rotateX(-Math.PI / 2);
@@ -456,11 +717,11 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     planeGeo.setAttribute("color", new THREE.BufferAttribute(meshColors, 3));
     planeGeo.computeVertexNormals();
 
-    // Create Realistic PBR Material
+    // Realistic PBR Material mapped with 2D RGB Texture
     const meshMat = new THREE.MeshStandardMaterial({
-      map: loadedTextureRef.current || null,
-      vertexColors: !loadedTextureRef.current,
-      roughness: 0.5,
+      map: loadedRgbTextureRef.current || null,
+      vertexColors: !loadedRgbTextureRef.current,
+      roughness: 0.45,
       metalness: 0.08,
       side: THREE.DoubleSide,
     });
@@ -472,8 +733,143 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     scene.add(meshObj);
     meshObjectRef.current = meshObj;
 
+    // Depth Colormap Mode Mesh
+    const depthMat = new THREE.MeshStandardMaterial({
+      map: loadedDepthTextureRef.current || null,
+      vertexColors: !loadedDepthTextureRef.current,
+      roughness: 0.5,
+      metalness: 0.1,
+      side: THREE.DoubleSide,
+    });
+    const depthMeshObj = new THREE.Mesh(planeGeo.clone(), depthMat);
+    depthMeshObj.receiveShadow = true;
+    depthMeshObj.castShadow = true;
+    depthMeshObj.visible = renderMode === "depth";
+    scene.add(depthMeshObj);
+    depthMeshObjectRef.current = depthMeshObj;
+
     // -------------------------------------------------------------
-    // 2. VOXEL WORLD (ROBLOX / MINECRAFT STYLE BLOCK CITY)
+    // 2. EXTRUDED 3D BUILDING STRUCTURES (SOLID WALLS & ROOFS)
+    // -------------------------------------------------------------
+    const buildingsGroup = new THREE.Group();
+    const refH = depthShape?.[0] ?? 1024;
+    const refW = depthShape?.[1] ?? 1024;
+
+    sampleBuildings.forEach((bldg) => {
+      const [bx, by, bw, bh] = bldg.bbox;
+      const cx = (bx + bw / 2) / refW;
+      const cy = (by + bh / 2) / refH;
+
+      const x3d = (cx - 0.5) * planeSize;
+      const z3d = (cy - 0.5) * planeSize;
+      const w3d = Math.max(2.5, (bw / refW) * planeSize);
+      const d3d = Math.max(2.5, (bh / refH) * planeSize);
+
+      const baseZ = Math.max(0.1, bldg.ground_base_z_rel * 28 * verticalExaggeration);
+      const roofZ = Math.max(baseZ + 2.0, bldg.rooftop_peak_z_rel * 28 * verticalExaggeration);
+      const wallHeight = roofZ - baseZ;
+
+      // Solid Extruded Building Box
+      const bldgGeo = new THREE.BoxGeometry(w3d * 0.98, wallHeight, d3d * 0.98);
+
+      // PBR Material with aerial texture mapping
+      const bldgMat = new THREE.MeshStandardMaterial({
+        map: loadedRgbTextureRef.current || null,
+        color: loadedRgbTextureRef.current ? 0xffffff : 0x00e5ff,
+        roughness: 0.35,
+        metalness: 0.2,
+      });
+
+      const bldgMesh = new THREE.Mesh(bldgGeo, bldgMat);
+      bldgMesh.position.set(x3d, baseZ + wallHeight / 2, z3d);
+      bldgMesh.castShadow = true;
+      bldgMesh.receiveShadow = true;
+      bldgMesh.userData = { buildingId: bldg.id, buildingName: bldg.name };
+
+      // Building Outline Edges
+      const edgesGeo = new THREE.EdgesGeometry(bldgGeo);
+      const lineMat = new THREE.LineBasicMaterial({
+        color: bldg.id === selectedBuilding?.id ? 0x10b981 : 0x38bdf8,
+        linewidth: 2,
+      });
+      const edgesMesh = new THREE.LineSegments(edgesGeo, lineMat);
+      bldgMesh.add(edgesMesh);
+
+      // Rooftop Structure Detail (HVAC / Elevator Shaft)
+      if (wallHeight > 6) {
+        const roofDetailGeo = new THREE.BoxGeometry(w3d * 0.35, 1.4, d3d * 0.35);
+        const roofDetailMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, roughness: 0.3 });
+        const roofDetailMesh = new THREE.Mesh(roofDetailGeo, roofDetailMat);
+        roofDetailMesh.position.set(0, wallHeight / 2 + 0.7, 0);
+        roofDetailMesh.castShadow = true;
+        bldgMesh.add(roofDetailMesh);
+      }
+
+      buildingsGroup.add(bldgMesh);
+    });
+
+    buildingsGroup.visible = renderMode === "mesh" || renderMode === "depth";
+    scene.add(buildingsGroup);
+    buildingsGroupRef.current = buildingsGroup;
+
+    // -------------------------------------------------------------
+    // 3. GPU INSTANCED VEGETATION (TREES OVER GREEN REGIONS)
+    // -------------------------------------------------------------
+    const treesGroup = new THREE.Group();
+    const treePositions: THREE.Vector3[] = [];
+
+    // Detect vegetation pixels from RGB colors
+    for (let r = 0; r < gh; r += 4) {
+      for (let c = 0; c < gw; c += 4) {
+        const idx = r * gw + c;
+        const red = mesh.colors[idx * 3] ?? 0.5;
+        const green = mesh.colors[idx * 3 + 1] ?? 0.5;
+        const blue = mesh.colors[idx * 3 + 2] ?? 0.5;
+        const rawH = heightsFiltered[idx] || 0.0;
+
+        const isGreenVegetation = green > red * 1.12 && green > blue * 1.08 && rawH < 0.35;
+        if (isGreenVegetation && (r * c) % 7 === 0) {
+          const posX = (c / gw - 0.5) * planeSize;
+          const posZ = (r / gh - 0.5) * planeSize;
+          const posY = rawH * 28.0 * verticalExaggeration;
+          treePositions.push(new THREE.Vector3(posX, posY, posZ));
+        }
+      }
+    }
+
+    if (treePositions.length > 0) {
+      const treeTrunkGeo = new THREE.CylinderGeometry(0.3, 0.45, 2.4, 6);
+      treeTrunkGeo.translate(0, 1.2, 0);
+      const treeLeavesGeo = new THREE.ConeGeometry(1.6, 3.2, 6);
+      treeLeavesGeo.translate(0, 3.6, 0);
+
+      const trunkMat = new THREE.MeshStandardMaterial({ color: 0x78350f, roughness: 0.9 });
+      const leavesMat = new THREE.MeshStandardMaterial({ color: 0x22c55e, roughness: 0.5 });
+
+      const instancedTrunks = new THREE.InstancedMesh(treeTrunkGeo, trunkMat, treePositions.length);
+      const instancedLeaves = new THREE.InstancedMesh(treeLeavesGeo, leavesMat, treePositions.length);
+
+      const dummyMatrix = new THREE.Matrix4();
+      treePositions.forEach((pos, i) => {
+        dummyMatrix.setPosition(pos.x, pos.y, pos.z);
+        instancedTrunks.setMatrixAt(i, dummyMatrix);
+        instancedLeaves.setMatrixAt(i, dummyMatrix);
+      });
+
+      instancedTrunks.instanceMatrix.needsUpdate = true;
+      instancedLeaves.instanceMatrix.needsUpdate = true;
+      instancedTrunks.castShadow = true;
+      instancedLeaves.castShadow = true;
+
+      treesGroup.add(instancedTrunks);
+      treesGroup.add(instancedLeaves);
+    }
+    treesGroup.visible = renderMode === "mesh";
+    scene.add(treesGroup);
+    treesGroupRef.current = treesGroup;
+
+    // -------------------------------------------------------------
+    // 4. VOXEL WORLD (ROBLOX / MINECRAFT STYLE BLOCK CITY)
     // -------------------------------------------------------------
     const voxelGroup = new THREE.Group();
     const vxCols = Math.min(56, gw);
@@ -494,17 +890,6 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     const instancedVoxels = new THREE.InstancedMesh(blockGeo, blockMat, totalVoxels);
     instancedVoxels.castShadow = true;
     instancedVoxels.receiveShadow = true;
-
-    const roofDetailsGeo = new THREE.BoxGeometry(blockWidth * 0.45, 1.2, blockDepth * 0.45);
-    roofDetailsGeo.translate(0, 0.6, 0);
-    const roofDetailsMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, roughness: 0.4 });
-    const roofDetailsGroup = new THREE.Group();
-
-    const treeTrunkGeo = new THREE.BoxGeometry(blockWidth * 0.3, 2.5, blockDepth * 0.3);
-    const treeLeavesGeo = new THREE.BoxGeometry(blockWidth * 1.1, 2.2, blockDepth * 1.1);
-    const treeTrunkMat = new THREE.MeshStandardMaterial({ color: 0x78350f, roughness: 0.9 });
-    const treeLeavesMat = new THREE.MeshStandardMaterial({ color: 0x22c55e, roughness: 0.6 });
-    const treeGroup = new THREE.Group();
 
     const dummyMatrix = new THREE.Matrix4();
     const colorObj = new THREE.Color();
@@ -534,35 +919,11 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
 
         if (isGreenVegetation) {
           colorObj.setRGB(0.18 + green * 0.4, 0.65 + green * 0.3, 0.18 + blue * 0.2);
-          if ((c + r) % 3 === 0 && (c * r) % 5 === 0) {
-            const trunkMesh = new THREE.Mesh(treeTrunkGeo, treeTrunkMat);
-            trunkMesh.position.set(posX, 0.5, posZ);
-            trunkMesh.castShadow = true;
-            treeGroup.add(trunkMesh);
-
-            const leavesMesh = new THREE.Mesh(treeLeavesGeo, treeLeavesMat);
-            leavesMesh.position.set(posX, 2.5, posZ);
-            leavesMesh.castShadow = true;
-            treeGroup.add(leavesMesh);
-          }
         } else if (isDarkRoad) {
           const isCrosswalkLine = (c % 8 === 0 && r % 2 === 0) || (r % 8 === 0 && c % 2 === 0);
           colorObj.setHex(isCrosswalkLine ? 0xe2e8f0 : 0x334155);
         } else if (isBuilding) {
-          if (red > green && red > blue * 1.1) {
-            colorObj.setRGB(0.85, 0.55 + red * 0.2, 0.42);
-          } else if (red > 0.6 && green > 0.6 && blue > 0.5) {
-            colorObj.setRGB(0.92, 0.86, 0.74);
-          } else {
-            colorObj.setRGB(0.48 + red * 0.3, 0.52 + green * 0.3, 0.58 + blue * 0.3);
-          }
-
-          if (rawH > 0.45 && (c * r) % 4 === 0) {
-            const hvacMesh = new THREE.Mesh(roofDetailsGeo, roofDetailsMat);
-            hvacMesh.position.set(posX, quantizedH, posZ);
-            hvacMesh.castShadow = true;
-            roofDetailsGroup.add(hvacMesh);
-          }
+          colorObj.setRGB(0.48 + red * 0.3, 0.52 + green * 0.3, 0.58 + blue * 0.3);
         } else {
           colorObj.setRGB(red * 0.95, green * 0.95, blue * 0.95);
         }
@@ -580,14 +941,12 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     if (instancedVoxels.instanceColor) instancedVoxels.instanceColor.needsUpdate = true;
 
     voxelGroup.add(instancedVoxels);
-    voxelGroup.add(roofDetailsGroup);
-    voxelGroup.add(treeGroup);
     voxelGroup.visible = renderMode === "voxel";
     scene.add(voxelGroup);
     voxelGroupRef.current = voxelGroup;
 
     // -------------------------------------------------------------
-    // 3. BUILD WIREFRAME MESH
+    // 5. WIREFRAME MESH
     // -------------------------------------------------------------
     const wireMat = new THREE.MeshBasicMaterial({
       color: 0x00e5ff,
@@ -601,7 +960,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     wireframeObjectRef.current = wireObj;
 
     // -------------------------------------------------------------
-    // 4. BUILD ELEVATION HEATMAP MESH
+    // 6. ELEVATION HEATMAP MESH
     // -------------------------------------------------------------
     const hmGeo = planeGeo.clone();
     hmGeo.setAttribute("color", new THREE.BufferAttribute(heatmapColors, 3));
@@ -616,7 +975,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     heatmapObjectRef.current = hmObj;
 
     // -------------------------------------------------------------
-    // 5. BUILD POINT CLOUD
+    // 7. POINT CLOUD
     // -------------------------------------------------------------
     if (pointcloud && pointcloud.positions.length > 0) {
       const pGeo = new THREE.BufferGeometry();
@@ -637,7 +996,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
       pGeo.setAttribute("color", new THREE.BufferAttribute(colArray, 3));
 
       const pMat = new THREE.PointsMaterial({
-        size: pointSize,
+        size: 1.6,
         vertexColors: true,
         sizeAttenuation: true,
       });
@@ -647,12 +1006,15 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
       scene.add(pts);
       pointsObjectRef.current = pts;
     }
-  }, [pointcloud, mesh, verticalExaggeration, pointSize, renderMode, getEdgePreservedHeights]);
+  }, [pointcloud, mesh, sampleBuildings, verticalExaggeration, renderMode, getEdgePreservedHeights, depthShape, selectedBuilding]);
 
-  // Visibility Switcher
+  // Mode Visibility Switcher
   useEffect(() => {
     if (meshObjectRef.current) meshObjectRef.current.visible = renderMode === "mesh";
+    if (depthMeshObjectRef.current) depthMeshObjectRef.current.visible = renderMode === "depth";
     if (voxelGroupRef.current) voxelGroupRef.current.visible = renderMode === "voxel";
+    if (buildingsGroupRef.current) buildingsGroupRef.current.visible = renderMode === "mesh" || renderMode === "depth";
+    if (treesGroupRef.current) treesGroupRef.current.visible = renderMode === "mesh";
     if (pointsObjectRef.current) pointsObjectRef.current.visible = renderMode === "pointcloud";
     if (wireframeObjectRef.current) wireframeObjectRef.current.visible = renderMode === "wireframe";
     if (heatmapObjectRef.current) heatmapObjectRef.current.visible = renderMode === "heatmap";
@@ -673,7 +1035,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     }
   }, [hoverCoordinate, verticalExaggeration]);
 
-  // Highlight Selected Building 3D Extruded Box
+  // Highlight Selected Building 3D Bounding Box
   useEffect(() => {
     const scene = sceneRef.current;
     if (!scene) return;
@@ -699,7 +1061,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
 
       const baseZ = selectedBuilding.ground_base_z_rel * 28 * verticalExaggeration;
       const roofZ = selectedBuilding.rooftop_peak_z_rel * 28 * verticalExaggeration;
-      const h3d = Math.max(1.8, roofZ - baseZ);
+      const h3d = Math.max(2.0, roofZ - baseZ);
 
       const boxGeo = new THREE.BoxGeometry(w3d, h3d, d3d);
       const edges = new THREE.EdgesGeometry(boxGeo);
@@ -724,29 +1086,37 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
     };
   }
 
+  // Camera Presets
   const resetCamera = () => {
     setIsFlythroughActive(false);
-    cameraTarget.current.set(0, 0, 0);
-    cameraAngle.current = { theta: Math.PI / 3.8, phi: Math.PI / 3.4, radius: 145 };
+    desiredCameraTarget.current.set(0, 0, 0);
+    desiredCameraAngle.current = { theta: Math.PI / 3.8, phi: Math.PI / 3.4, radius: 145 };
     updateCameraPosition();
   };
 
   const setIsometricView = () => {
     setIsFlythroughActive(false);
-    cameraTarget.current.set(0, 0, 0);
-    cameraAngle.current = { theta: Math.PI / 4, phi: Math.PI / 3.2, radius: 135 };
+    desiredCameraTarget.current.set(0, 0, 0);
+    desiredCameraAngle.current = { theta: Math.PI / 4, phi: Math.PI / 3.2, radius: 135 };
     updateCameraPosition();
   };
 
   const setTopView = () => {
     setIsFlythroughActive(false);
-    cameraTarget.current.set(0, 0, 0);
-    cameraAngle.current = { theta: 0, phi: 0.05, radius: 155 };
+    desiredCameraTarget.current.set(0, 0, 0);
+    desiredCameraAngle.current = { theta: 0, phi: 0.05, radius: 155 };
+    updateCameraPosition();
+  };
+
+  const setStreetView = () => {
+    setIsFlythroughActive(false);
+    desiredCameraTarget.current.set(0, 3, 0);
+    desiredCameraAngle.current = { theta: Math.PI / 4, phi: Math.PI / 2.2, radius: 75 };
     updateCameraPosition();
   };
 
   return (
-    <div className="relative w-full h-[550px] rounded-xl overflow-hidden border border-slate-800 bg-[#070A0F] flex flex-col select-none">
+    <div className="relative w-full h-[580px] rounded-2xl overflow-hidden border border-slate-800 bg-[#070A0F] flex flex-col select-none shadow-2xl">
       
       {/* ------------------------------------------------------------- */}
       {/* TOP-LEFT OVERLAY: DepthWizard 3D Header Badge */}
@@ -759,15 +1129,15 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
           <h3 className="text-xs font-extrabold text-slate-100 tracking-wide uppercase font-mono-data flex items-center gap-1.5">
             DepthWizard 3D
             <Badge variant="outline" className="bg-cyan-500/20 text-cyan-300 border-cyan-500/40 text-[9px] px-1 py-0 font-mono-data">
-              HD Photogrammetry
+              Photogrammetry Engine
             </Badge>
           </h3>
-          <p className="text-[10px] text-slate-400 font-mono-data">Real 2D UV Texture → Crisp 3D Elevation</p>
+          <p className="text-[10px] text-slate-400 font-mono-data">Explorable 2D-to-3D Aerial World</p>
         </div>
       </div>
 
       {/* ------------------------------------------------------------- */}
-      {/* TOP-RIGHT OVERLAY: Mode Switcher & Camera Views */}
+      {/* TOP-RIGHT OVERLAY: Mode Switcher & Camera View Presets */}
       {/* ------------------------------------------------------------- */}
       <div className="absolute top-3 right-3 z-20 flex items-center gap-2 pointer-events-none">
         <div className="flex items-center gap-1 p-1 bg-[#0F172A]/90 backdrop-blur-md rounded-xl border border-slate-700 pointer-events-auto shadow-xl">
@@ -781,8 +1151,22 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
             }`}
           >
             <ImageIcon className="w-3.5 h-3.5 mr-1" />
-            Textured 3D Mesh
+            Realistic PBR
           </Button>
+
+          <Button
+            size="sm"
+            variant={renderMode === "depth" ? "default" : "ghost"}
+            onClick={() => setRenderMode("depth")}
+            data-testid="viewer-mode-depth-button"
+            className={`h-7 px-2.5 text-xs font-mono-data ${
+              renderMode === "depth" ? "bg-cyan-500 text-black font-bold" : "text-slate-300 hover:text-white"
+            }`}
+          >
+            <Layers className="w-3.5 h-3.5 mr-1" />
+            Depth Map
+          </Button>
+
           <Button
             size="sm"
             variant={renderMode === "voxel" ? "default" : "ghost"}
@@ -795,6 +1179,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
             <Boxes className="w-3.5 h-3.5 mr-1" />
             Voxel World
           </Button>
+
           <Button
             size="sm"
             variant={renderMode === "pointcloud" ? "default" : "ghost"}
@@ -807,6 +1192,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
             <Box className="w-3.5 h-3.5 mr-1" />
             Point Cloud
           </Button>
+
           <Button
             size="sm"
             variant={renderMode === "wireframe" ? "default" : "ghost"}
@@ -819,6 +1205,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
             <Grid3X3 className="w-3.5 h-3.5 mr-1" />
             Wireframe
           </Button>
+
           <Button
             size="sm"
             variant={renderMode === "heatmap" ? "default" : "ghost"}
@@ -829,11 +1216,12 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
             }`}
           >
             <Flame className="w-3.5 h-3.5 mr-1" />
-            Heatmap
+            Height
           </Button>
 
           <div className="w-[1px] h-4 bg-slate-700 mx-0.5" />
 
+          {/* Camera View Presets */}
           <Button
             size="icon-xs"
             variant="ghost"
@@ -855,6 +1243,17 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
           >
             <Eye className="w-3.5 h-3.5" />
           </Button>
+
+          <Button
+            size="icon-xs"
+            variant="ghost"
+            onClick={setStreetView}
+            title="Street-Level View"
+            data-testid="viewer-streetview-button"
+            className="text-slate-300 hover:text-cyan-400 h-7 w-7"
+          >
+            <Camera className="w-3.5 h-3.5" />
+          </Button>
         </div>
       </div>
 
@@ -866,7 +1265,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
         {/* Height Legend Panel */}
         <div className="p-3 bg-[#0F172A]/90 backdrop-blur-md rounded-xl border border-slate-700/80 shadow-xl pointer-events-auto text-xs font-mono-data space-y-2">
           <div className="flex items-center justify-between text-slate-200 font-bold border-b border-slate-800 pb-1.5">
-            <span>Height (meters)</span>
+            <span>Elevation (m)</span>
             <span className="text-[10px] text-cyan-400">{selectedBuilding?.calibrated_height_m ? 'Metric' : 'Relative'}</span>
           </div>
 
@@ -886,7 +1285,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
         {/* Controls Panel */}
         <div className="p-3 bg-[#0F172A]/90 backdrop-blur-md rounded-xl border border-slate-700/80 shadow-xl pointer-events-auto text-xs font-mono-data space-y-2">
           <div className="flex items-center justify-between text-slate-200 font-bold border-b border-slate-800 pb-1.5">
-            <span>Controls</span>
+            <span>Spatial Physics</span>
             <Button
               size="icon-xs"
               variant="ghost"
@@ -898,26 +1297,24 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
             </Button>
           </div>
 
-          <div className="space-y-1.5 text-[11px] text-slate-300">
-            <div className="flex items-center gap-2">
-              <div className="w-4 h-4 rounded bg-slate-800 border border-slate-700 flex items-center justify-center text-cyan-400">
-                <MousePointer className="w-2.5 h-2.5" />
-              </div>
-              <span>Left Drag: Rotate</span>
+          <div className="space-y-1 text-[10px] text-slate-300">
+            <div className="flex items-center gap-1.5">
+              <span className="font-bold text-cyan-400">WASD</span>
+              <span>Fly Camera</span>
             </div>
-            <div className="flex items-center gap-2">
-              <div className="w-4 h-4 rounded bg-slate-800 border border-slate-700 flex items-center justify-center text-emerald-400">
-                <Move className="w-2.5 h-2.5" />
-              </div>
-              <span>Right Drag: Pan</span>
+            <div className="flex items-center gap-1.5">
+              <span className="font-bold text-emerald-400">Left Drag</span>
+              <span>Orbit / Rotate</span>
             </div>
-            <div className="flex items-center gap-2">
-              <div className="w-4 h-4 rounded bg-slate-800 border border-slate-700 flex items-center justify-center text-amber-400">
-                <ZoomIn className="w-2.5 h-2.5" />
-              </div>
-              <span>Scroll: Zoom</span>
+            <div className="flex items-center gap-1.5">
+              <span className="font-bold text-amber-400">Right Drag</span>
+              <span>Pan Camera</span>
             </div>
-            <div className="pt-1 flex items-center gap-1.5">
+            <div className="flex items-center gap-1.5">
+              <span className="font-bold text-indigo-400">Dbl Click</span>
+              <span>Focus Object</span>
+            </div>
+            <div className="pt-1">
               <Button
                 size="sm"
                 variant="outline"
@@ -931,6 +1328,73 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
         </div>
 
       </div>
+
+      {/* ------------------------------------------------------------- */}
+      {/* HOVER TOOLTIP CARD */}
+      {/* ------------------------------------------------------------- */}
+      {hoverTooltip && (
+        <div
+          style={{ left: hoverTooltip.x + 15, top: hoverTooltip.y - 15 }}
+          className="absolute z-30 pointer-events-none p-2 px-3 bg-[#0F172A]/95 border border-cyan-500/40 rounded-lg shadow-2xl backdrop-blur-md font-mono-data text-xs space-y-0.5"
+        >
+          <div className="flex items-center gap-1.5 text-cyan-300 font-bold">
+            <Building2 className="w-3.5 h-3.5" />
+            <span>{hoverTooltip.info}</span>
+          </div>
+          <div className="text-[10px] text-slate-300">
+            Height: <span className="text-emerald-400 font-semibold">{hoverTooltip.height}</span>
+          </div>
+        </div>
+      )}
+
+      {/* ------------------------------------------------------------- */}
+      {/* FLOATING SELECTED BUILDING INFO CARD */}
+      {/* ------------------------------------------------------------- */}
+      {selectedBuilding && (
+        <div className="absolute bottom-16 left-3 z-20 pointer-events-auto p-3.5 bg-[#0F172A]/95 backdrop-blur-md rounded-xl border border-emerald-500/40 shadow-2xl w-64 space-y-2 font-mono-data text-xs animate-in fade-in slide-in-from-left-4">
+          <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+            <div className="flex items-center gap-2 text-emerald-400 font-bold">
+              <Building2 className="w-4 h-4" />
+              <span className="truncate">{selectedBuilding.name}</span>
+            </div>
+            <button
+              onClick={() => onSelectBuilding?.(null)}
+              className="text-slate-400 hover:text-white text-xs px-1"
+            >
+              ✕
+            </button>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 text-[11px]">
+            <div className="p-2 bg-slate-900/90 rounded-lg border border-slate-800">
+              <span className="text-slate-400 block text-[9px]">ESTIMATED HEIGHT</span>
+              <span className="text-emerald-300 font-bold text-sm">
+                {selectedBuilding.calibrated_height_m 
+                  ? `${selectedBuilding.calibrated_height_m} m` 
+                  : `${selectedBuilding.relative_height_unitless.toFixed(2)} rel`}
+              </span>
+            </div>
+
+            <div className="p-2 bg-slate-900/90 rounded-lg border border-slate-800">
+              <span className="text-slate-400 block text-[9px]">CONFIDENCE</span>
+              <span className="text-cyan-300 font-bold text-sm">
+                {selectedBuilding.confidence_pct}%
+              </span>
+            </div>
+          </div>
+
+          <div className="text-[10px] text-slate-300 space-y-1">
+            <div className="flex justify-between">
+              <span className="text-slate-400">Surface Type:</span>
+              <span className="text-slate-200 font-semibold">Building Roof Plate</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-slate-400">Footprint Box:</span>
+              <span className="text-slate-200">{selectedBuilding.bbox[2]}×{selectedBuilding.bbox[3]} px</span>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ------------------------------------------------------------- */}
       {/* BOTTOM-LEFT OVERLAY: Input Aerial Image Thumbnail Overlay */}
@@ -948,8 +1412,19 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
                   <Minimize2 className="w-3 h-3" />
                 </button>
               </div>
-              <div className="w-full h-28 rounded-lg overflow-hidden border border-slate-800 bg-black">
+              <div className="w-full h-28 rounded-lg overflow-hidden border border-slate-800 bg-black relative">
                 <img src={imageUrl} alt="Input Aerial" className="w-full h-full object-cover" />
+                {selectedBuilding && (
+                  <div
+                    style={{
+                      left: `${(selectedBuilding.bbox[0] / (depthShape?.[1] || 1024)) * 100}%`,
+                      top: `${(selectedBuilding.bbox[1] / (depthShape?.[0] || 1024)) * 100}%`,
+                      width: `${(selectedBuilding.bbox[2] / (depthShape?.[1] || 1024)) * 100}%`,
+                      height: `${(selectedBuilding.bbox[3] / (depthShape?.[0] || 1024)) * 100}%`,
+                    }}
+                    className="absolute border-2 border-emerald-400 bg-emerald-400/20 shadow-md animate-pulse pointer-events-none"
+                  />
+                )}
               </div>
             </div>
           ) : (
@@ -967,15 +1442,15 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
       )}
 
       {/* ------------------------------------------------------------- */}
-      {/* BOTTOM-RIGHT OVERLAY: Description & Controls */}
+      {/* BOTTOM-RIGHT OVERLAY: Telemetry & Controls */}
       {/* ------------------------------------------------------------- */}
       <div className="absolute bottom-3 right-3 z-20 max-w-xs p-3 bg-[#0F172A]/90 backdrop-blur-md rounded-xl border border-slate-700/80 shadow-xl pointer-events-auto text-xs text-slate-300 font-mono-data space-y-1">
         <h4 className="font-bold text-slate-100 flex items-center gap-1.5">
           <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
-          Realistic 2D-to-3D UV Photogrammetry
+          Interactive 3D Reconstruction
         </h4>
         <p className="text-[11px] text-slate-400 leading-tight">
-          High-definition 2D texture mapped onto edge-preserved neural depth geometry.
+          PBR shader textures projected onto edge-sharpened neural depth.
         </p>
         <div className="pt-1 flex items-center justify-between">
           <Button
@@ -989,6 +1464,7 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
             {isFlythroughActive ? <Pause className="w-3 h-3 mr-1" /> : <Play className="w-3 h-3 mr-1" />}
             {isFlythroughActive ? `Flythrough ${flythroughProgress}%` : "Cinematic Flythrough"}
           </Button>
+
           <div className="flex items-center gap-1 text-[10px] text-slate-400 font-mono-data">
             <span>Scale:</span>
             <input
@@ -1004,6 +1480,52 @@ export const ThreeViewer: React.FC<ThreeViewerProps> = ({
           </div>
         </div>
       </div>
+
+      {/* ------------------------------------------------------------- */}
+      {/* RECONSTRUCTION LOADING OVERLAY */}
+      {/* ------------------------------------------------------------- */}
+      {loadingStep < 7 && (
+        <div className="absolute inset-0 z-40 bg-[#070A0F]/95 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center font-mono-data space-y-4">
+          <div className="relative flex items-center justify-center w-16 h-16 rounded-2xl bg-cyan-500/10 border border-cyan-400/40 text-cyan-400 shadow-2xl">
+            <Loader2 className="w-8 h-8 animate-spin" />
+            <Sparkles className="w-4 h-4 absolute top-2 right-2 text-cyan-300 animate-pulse" />
+          </div>
+
+          <div>
+            <h3 className="text-base font-extrabold text-white tracking-wide">
+              RECONSTRUCTING 3D WORLD
+            </h3>
+            <p className="text-xs text-slate-400 mt-1">Generating photorealistic interactive WebGL environment</p>
+          </div>
+
+          <div className="w-72 space-y-2 text-left text-xs bg-slate-900/90 p-4 rounded-xl border border-slate-800">
+            <div className={`flex items-center gap-2 ${loadingStep >= 1 ? "text-cyan-300" : "text-slate-600"}`}>
+              {loadingStep > 1 ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> : <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+              <span>Loading aerial image</span>
+            </div>
+            <div className={`flex items-center gap-2 ${loadingStep >= 2 ? "text-cyan-300" : "text-slate-600"}`}>
+              {loadingStep > 2 ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> : loadingStep === 2 ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
+              <span>Computing neural depth map</span>
+            </div>
+            <div className={`flex items-center gap-2 ${loadingStep >= 3 ? "text-cyan-300" : "text-slate-600"}`}>
+              {loadingStep > 3 ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> : loadingStep === 3 ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
+              <span>Detecting structure footprints</span>
+            </div>
+            <div className={`flex items-center gap-2 ${loadingStep >= 4 ? "text-cyan-300" : "text-slate-600"}`}>
+              {loadingStep > 4 ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> : loadingStep === 4 ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
+              <span>Generating 3D wall skirts & terrain</span>
+            </div>
+            <div className={`flex items-center gap-2 ${loadingStep >= 5 ? "text-cyan-300" : "text-slate-600"}`}>
+              {loadingStep > 5 ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> : loadingStep === 5 ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
+              <span>Applying PBR UV aerial textures</span>
+            </div>
+            <div className={`flex items-center gap-2 ${loadingStep >= 6 ? "text-cyan-300" : "text-slate-600"}`}>
+              {loadingStep > 6 ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> : loadingStep === 6 ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
+              <span>Finalizing lighting & shadows</span>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* WEBGL CANVAS */}
       <div

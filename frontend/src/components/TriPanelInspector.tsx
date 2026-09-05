@@ -12,7 +12,7 @@ import {
 interface TriPanelInspectorProps {
   data: DepthProcessResponse | null;
   selectedBuilding: BuildingMeasurement | null;
-  onSelectBuilding: (bldg: BuildingMeasurement) => void;
+  onSelectBuilding: (bldg: BuildingMeasurement | null) => void;
   onCustomMeasure?: (bbox: [number, number, number, number]) => void;
 }
 
@@ -407,7 +407,10 @@ export const TriPanelInspector: React.FC<TriPanelInspectorProps> = ({
             pointcloud={data.pointcloud}
             mesh={data.mesh}
             imageUrl={data.image_url}
+            depthColormapUrl={depthImageUrl}
             selectedBuilding={selectedBuilding}
+            sampleBuildings={data.sample_buildings}
+            onSelectBuilding={onSelectBuilding}
             hoverCoordinate={hoverCoord}
             depthShape={data.raw_depth_stats.shape}
           />
